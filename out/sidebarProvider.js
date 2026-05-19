@@ -1,0 +1,3304 @@
+"use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.SidebarProvider = void 0;
+const vscode = __importStar(require("vscode"));
+const fs = __importStar(require("fs"));
+const path = __importStar(require("path"));
+const accountStore = __importStar(require("./accountStore"));
+const loginService_1 = require("./loginService");
+const sessionInjector_1 = require("./sessionInjector");
+const instanceManager = __importStar(require("./instanceManager"));
+const signalBridge_1 = require("./signalBridge");
+const enhancementInjector_1 = require("./enhancementInjector");
+const enhSettingsStore_1 = require("./enhSettingsStore");
+const bridgeServer_1 = require("./bridgeServer");
+const rulesInjector_1 = require("./rulesInjector");
+const soundPlayer_1 = require("./soundPlayer");
+const accountLock_1 = require("./accountLock");
+const healthCheckPanel_1 = require("./healthCheckPanel");
+const contextMonitor_1 = require("./contextMonitor");
+const usageService_1 = require("./usageService");
+const cascadeProbe_1 = require("./cascadeProbe");
+const acpRecovery_1 = require("./acpRecovery");
+const windsurfOAuthService_1 = require("./windsurfOAuthService");
+/**
+ * 侧栏 Webview 提供器
+ */
+class SidebarProvider {
+    constructor(_extensionUri, _context, autoSwitcher, usageTracker) {
+        this._extensionUri = _extensionUri;
+        this._context = _context;
+        this._disposables = [];
+        this._output = vscode.window.createOutputChannel('Windsurf 号池');
+        this._startTs = Date.now();
+        this._lastSoundTs = 0; // 防重：上次播放时间戳
+        this._lastUsagePercent = new Map(); // 上次额度快照，用于检测额度减少
+        // 通用 webview 确认弹窗（需要回调）
+        this._alertCallbacks = new Map();
+        this._usageTracker = usageTracker;
+        // 日志文件：globalStorage/windsurf-pool.log（保留最近 500KB）
+        try {
+            fs.mkdirSync(this._context.globalStorageUri.fsPath, { recursive: true });
+        }
+        catch { }
+        this._logFilePath = path.join(this._context.globalStorageUri.fsPath, 'windsurf-pool.log');
+        // 每次启动在文件头写分隔符
+        try {
+            const header = `\n\n==================== ${new Date().toISOString()} ====================\n`;
+            fs.appendFileSync(this._logFilePath, header, 'utf8');
+            // 文件过大则截断（只保留后 200KB）
+            const stat = fs.statSync(this._logFilePath);
+            if (stat.size > 500 * 1024) {
+                const buf = fs.readFileSync(this._logFilePath);
+                fs.writeFileSync(this._logFilePath, buf.slice(-200 * 1024));
+            }
+        }
+        catch { }
+        // 绑定后端自动切号引擎
+        this._autoSwitcher = autoSwitcher;
+        this._autoSwitcher.onUsageUpdate = (email, snapshot, error) => {
+            // 检测额度减少 → 正在正常消耗 → 清除测活异常
+            if (snapshot && typeof snapshot.dailyRemainingPercent === 'number') {
+                const cur = snapshot.dailyRemainingPercent;
+                const prev = this._lastUsagePercent.get(email);
+                const hc = (0, healthCheckPanel_1.getHealthCheckCache)().get(email);
+                if (hc && !hc.ok) {
+                    if (prev !== undefined && cur < prev) {
+                        (0, healthCheckPanel_1.clearHealthResult)(email);
+                        this._recordDiagnostic(email, 'health', true, '额度消耗中，已清除异常');
+                        this.postMessage({ type: 'testModelResult', email, ok: true, reason: '额度消耗中，已清除异常', ts: Date.now() });
+                        this.log(`[usageWatch] ✓ ${email} 额度 ${prev}% → ${cur}%，清除测活异常`);
+                    }
+                }
+                this._lastUsagePercent.set(email, cur);
+            }
+            this.postMessage({ type: 'usage', email, snapshot, error });
+            this._pushUsageStats();
+        };
+        this._autoSwitcher.onSwitchEvent = (log, status, statusType) => {
+            this.postMessage({ type: 'autoSwitchEvent', log, status, statusType });
+            // 持久化切号日志（webview 重建后可恢复）
+            if (log) {
+                const logs = this._context.globalState.get('autoSwitchLogs', []);
+                logs.push(log);
+                if (logs.length > 200)
+                    logs.splice(0, logs.length - 200);
+                this._context.globalState.update('autoSwitchLogs', logs);
+            }
+        };
+        this._autoSwitcher.onRefreshUI = () => {
+            this.refresh();
+        };
+        // 配额变动时实时推送历史
+        this._usageTracker.onHistoryUpdate = () => {
+            this._pushQuotaHistory();
+            this._pushDiagnosticSync();
+        };
+        // 定时器自动切号成功后 → 通知 bridge（windsurf-better.js 显示通知 + 重试消息）
+        this._autoSwitcher.onAutoSwitchDone = (newEmail, reason) => {
+            // 推送 pool-result 到 bridge，让 windsurf-better.js 处理（显示通知 + 重试）
+            try {
+                (0, bridgeServer_1.enqueueCommand)({
+                    id: Date.now(),
+                    action: 'pool-result',
+                    payload: { type: 'switched', ts: Date.now(), email: newEmail }
+                });
+            }
+            catch { }
+            // 弹 VS Code 通知（面板关着也能看到）
+            vscode.window.showInformationMessage(`额度不足，已自动切换至 ${newEmail}`);
+        };
+        // 监听 bridge 的 /result：
+        // - type='pool-signal' → 切号请求（windsurf-better.js 主动发起），由 autoSwitcher 处理后反向回传
+        // - 其他 → 命令结果，转发给 webview 显示
+        const unsubscribeBridge = (0, bridgeServer_1.onBridgeResult)((result) => {
+            try {
+                if (result && result.type === 'pool-signal' && result.signal) {
+                    this.log(`[bridge ←] pool-signal type=${result.signal.type}`);
+                    this._usageTracker.recordPoolSignal();
+                    (0, signalBridge_1.handlePoolSignal)(result.signal, this._autoSwitcher, (poolResult) => {
+                        // 通过 enqueueCommand 反向把切号结果送回 windsurf-better.js
+                        // windsurf-better.js 收到 action='pool-result' 命令 → 写 localStorage 触发原处理逻辑
+                        (0, bridgeServer_1.enqueueCommand)({ id: Date.now(), action: 'pool-result', payload: poolResult });
+                    }).catch(err => console.warn('[sidebar] handlePoolSignal err:', err));
+                    return;
+                }
+                // 完成提醒：通过 bridge 收到播放声音请求
+                if (result && result.type === 'notify-sound') {
+                    this._playNotifyOnce(result.tone || 'funk', result.repeat || 2, result.customTone, result.audioFile, result.sound !== false, !!result.desktop, result.title, result.body);
+                    return;
+                }
+                // 长任务状态通知：转发给 webview 更新 UI
+                if (result?.action === 'lt-stopped') {
+                    this.postMessage({ type: 'ltStateUpdate', state: 'stopped', reason: result.reason, count: result.count });
+                    return;
+                }
+                if (result?.action === 'lt-count') {
+                    this.postMessage({ type: 'ltStateUpdate', state: 'running', count: result.count, action: '✅ 发送"' + (result.text || '') + '"' });
+                    return;
+                }
+                if (result?.action === 'ac-stats') {
+                    this.postMessage({ type: 'acStatsUpdate', stats: result.stats });
+                    return;
+                }
+                // 恢复/诊断日志同步：windsurf-better.js 主动推送或响应 syncLogs 命令
+                // 无论统计面板是否打开都存入 globalState，面板打开时直接读取
+                if (result?.action === 'syncLogs' && result?.payload) {
+                    if (Array.isArray(result.payload.recoveryLogs)) {
+                        this._context.globalState.update('recoveryLogs', result.payload.recoveryLogs);
+                    }
+                    if (Array.isArray(result.payload.diagnoseLogs)) {
+                        this._context.globalState.update('diagnoseLogs', result.payload.diagnoseLogs);
+                    }
+                    return;
+                }
+                this.log(`[bridge ←] action=${result?.action} id=${result?.id} status=${result?.status}`);
+                this.postMessage({ type: 'enhCommandResult', result });
+            }
+            catch (err) {
+                this.log(`[bridge ←] ✗ 异常: ${err}`);
+            }
+        });
+        this._disposables.push({ dispose: unsubscribeBridge });
+        // 定时 contextMonitor 检查：当前账号有活跃 session 有 token → 清除限速状态
+        const contextCheckTimer = setInterval(() => this._checkContextForHealthClear(), 60000);
+        this._disposables.push({ dispose: () => clearInterval(contextCheckTimer) });
+    }
+    async _checkContextForHealthClear() {
+        try {
+            const currentEmail = this._context.globalState.get('lastEmail') || '';
+            if (!currentEmail)
+                return;
+            const hcCache = (0, healthCheckPanel_1.getHealthCheckCache)();
+            const hc = hcCache.get(currentEmail);
+            if (!hc || hc.ok || hc.testing)
+                return;
+            const snap = await (0, contextMonitor_1.getContextMonitorSnapshot)();
+            if (!snap.ok || !snap.active)
+                return;
+            // 检查活跃 session 是否有近期 token 产出（5 分钟内更新）
+            const updatedAt = Date.parse(snap.active.updatedAt || '');
+            if (!updatedAt || Date.now() - updatedAt > 5 * 60000)
+                return;
+            if ((snap.active.outputTokens || 0) <= 0)
+                return;
+            // 有活跃 token 产出 → 账号正在正常使用，清除所有测活异常
+            hcCache.set(currentEmail, {
+                ...hc,
+                ok: true,
+                reason: 'Cascade 活跃使用中，已清除异常',
+                ts: Date.now(),
+            });
+            this._recordDiagnostic(currentEmail, 'health', true, 'Cascade 活跃使用中，已清除异常');
+            this.postMessage({ type: 'testModelResult', email: currentEmail, ok: true, reason: 'Cascade 活跃使用中，已清除异常', ts: Date.now() });
+            this.log(`[contextMonitor] ${currentEmail} 有活跃 session（outputTokens=${snap.active.outputTokens}），清除测活异常`);
+        }
+        catch (err) {
+            // ignore
+        }
+    }
+    _recordSwitchLog(log, status, statusType = '') {
+        this.postMessage({ type: 'autoSwitchEvent', log, status, statusType });
+        if (log) {
+            const logs = this._context.globalState.get('autoSwitchLogs', []);
+            logs.push(log);
+            if (logs.length > 200)
+                logs.splice(0, logs.length - 200);
+            this._context.globalState.update('autoSwitchLogs', logs);
+        }
+    }
+    _tsFmt() {
+        const n = new Date();
+        return `${String(n.getHours()).padStart(2, '0')}:${String(n.getMinutes()).padStart(2, '0')}:${String(n.getSeconds()).padStart(2, '0')}`;
+    }
+    log(msg) {
+        const elapsed = ((Date.now() - this._startTs) / 1000).toFixed(2);
+        const ts = new Date().toISOString().substring(11, 23);
+        const line = `[${ts}] [+${elapsed}s] ${msg}`;
+        this._output.appendLine(line);
+        try {
+            fs.appendFileSync(this._logFilePath, line + '\n', 'utf8');
+        }
+        catch { }
+    }
+    /** 显示日志面板 */
+    showLog() {
+        this._output.appendLine(`日志文件: ${this._logFilePath}`);
+        this._output.show(true);
+    }
+    /** 主动通知 webview 刷新 Windsurf 增强状态（供外部命令在修改文件/配置后调用） */
+    refreshEnhancementStatus() {
+        this._pushEnhancementStatus();
+    }
+    /**
+     * 推送 bridge 端口/token 到 sidebar webview，由 webview 转发给同进程的
+     * workbench renderer（window.top.postMessage）。
+     * 多实例关键：此通道是"同进程 sidebar iframe ↔ workbench 顶层 frame"，天然隔离。
+     */
+    refreshBridgeInfo() {
+        const info = (0, bridgeServer_1.getBridgeInfo)();
+        if (!info)
+            return;
+        this._view?.webview.postMessage({ type: 'bridgeInfo', port: info.port, token: info.token });
+    }
+    /**
+     * 从 Windsurf 本地 SQLite 数据库直接读取可用模型列表
+     * 路径: %APPDATA%/Windsurf/User/globalStorage/state.vscdb
+     * 键: windsurfConfigurations（base64 protobuf，含模型 label 文本）
+     * 零 UI 操作、零 DOM 交互、瞬间返回
+     */
+    async _handleFetchModels(cmdId) {
+        try {
+            const allModels = await this._readModelsFromStateDb();
+            // 获取最近使用的模型 UID
+            let recentUids = [];
+            let currentModel = '';
+            try {
+                const codeiumState = await this._readStateDbKey('codeium.windsurf');
+                if (codeiumState) {
+                    const state = JSON.parse(codeiumState);
+                    const selected = state['windsurf.state.lastSelectedCascadeModelUids'];
+                    if (Array.isArray(selected)) {
+                        recentUids = selected;
+                        const rawCurrent = selected[0] || '';
+                        // 将 UID/汉化名映射回可读 label（state DB 可能存了汉化后的名称）
+                        currentModel = this._resolveModelLabel(rawCurrent, allModels) || rawCurrent;
+                    }
+                }
+            }
+            catch { }
+            // 过滤：只保留主流基础模型 + 最近使用的
+            const models = this._filterMainstreamModels(allModels, recentUids);
+            this.postMessage({ type: 'enhCommandResult', result: {
+                    id: cmdId, action: 'fetch-models', status: 'done',
+                    models, currentModel
+                } });
+        }
+        catch (err) {
+            this.postMessage({ type: 'enhCommandResult', result: {
+                    id: cmdId, action: 'fetch-models', status: 'error',
+                    message: '读取模型数据库失败: ' + err
+                } });
+        }
+    }
+    /** 将 state DB 中的 UID 或汉化名映射回可读模型 label */
+    _resolveModelLabel(raw, allModels) {
+        if (!raw)
+            return '';
+        // 精确匹配
+        if (allModels.includes(raw))
+            return raw;
+        // UID 模糊匹配: claude-opus-4-7-medium → Claude Opus 4.7 Medium
+        const rawNorm = raw.replace(/[-_.]/g, ' ').toLowerCase();
+        for (const m of allModels) {
+            const mNorm = m.replace(/[-.\s]/g, ' ').toLowerCase();
+            if (mNorm === rawNorm || rawNorm.includes(mNorm) || mNorm.includes(rawNorm))
+                return m;
+        }
+        // 去掉中文字符后再匹配（处理汉化残留如 "SWE-1.6New免费" → "SWE-1.6New"）
+        const rawAscii = raw.replace(/[^\x00-\x7F]/g, '').trim();
+        if (rawAscii && rawAscii !== raw) {
+            const asciiNorm = rawAscii.replace(/[-_.]/g, ' ').toLowerCase();
+            for (const m of allModels) {
+                const mNorm = m.replace(/[-.\s]/g, ' ').toLowerCase();
+                if (mNorm.includes(asciiNorm) || asciiNorm.includes(mNorm))
+                    return m;
+            }
+        }
+        return '';
+    }
+    /** 过滤只保留主流模型 + 最近使用 */
+    _filterMainstreamModels(allModels, recentUids) {
+        // 排除含这些关键词的变体（Low/Medium/High/XHigh/Fast/Mini/BYOK/1M/Spark/Max）
+        // 注意：Thinking 不排除，因为它是重要的模型行为差异（Claude Opus 4.6 vs Claude Opus 4.6 Thinking）
+        const variantRe = /\b(Low|Medium|High|XHigh|X-High|Fast|Mini|BYOK|1M|Spark|Max|Minimal)\b/i;
+        const mainstream = allModels.filter(m => !variantRe.test(m));
+        // 把最近使用的 uid 转成 label 匹配（uid: claude-opus-4-7-medium → 匹配 "Claude Opus 4.7 Medium"）
+        const recentLabels = [];
+        for (const uid of recentUids) {
+            const normalized = uid.replace(/-/g, ' ').toLowerCase();
+            const match = allModels.find(m => {
+                const mNorm = m.replace(/[.\-]/g, ' ').toLowerCase();
+                return mNorm === normalized || normalized.includes(mNorm) || mNorm.includes(normalized);
+            });
+            if (match && !mainstream.includes(match))
+                recentLabels.push(match);
+        }
+        // 合并：主流 + 最近使用（去重）
+        const result = [...mainstream];
+        for (const r of recentLabels) {
+            if (!result.includes(r))
+                result.push(r);
+        }
+        return result;
+    }
+    _readStateDbKey(key) {
+        const dbPath = path.join(process.env.APPDATA || '', 'Windsurf/User/globalStorage/state.vscdb');
+        const sqlitePath = path.join(vscode.env.appRoot, 'node_modules/@vscode/sqlite3');
+        return new Promise((resolve, reject) => {
+            try {
+                const sqlite = require(sqlitePath);
+                const db = new sqlite.Database(dbPath, sqlite.OPEN_READONLY, (err) => {
+                    if (err) {
+                        reject(err);
+                        return;
+                    }
+                    db.get('SELECT value FROM ItemTable WHERE key = ?', [key], (e, row) => {
+                        db.close();
+                        if (e)
+                            reject(e);
+                        else
+                            resolve(row ? row.value : null);
+                    });
+                });
+            }
+            catch (e) {
+                reject(e);
+            }
+        });
+    }
+    _diagnosticLevel(ok, reason) {
+        if (ok)
+            return 'ok';
+        return /全局限制|长期不可用|限流|限速|rate limit|message limit|消息.*上限|已达上限|用尽|cooldown|reset|暂不可用/i.test(reason || '') ? 'warn' : 'error';
+    }
+    _recordDiagnostic(email, source, ok, reason, model, status) {
+        this._usageTracker.recordDiagnostic({
+            ts: Date.now(),
+            email,
+            source,
+            level: this._diagnosticLevel(ok, reason),
+            reason: ok ? (reason || (source === 'switch' ? '切换成功' : '测活正常')) : (reason || '未知原因'),
+            model,
+            status,
+        });
+    }
+    _pushDiagnosticSync() {
+        this.postMessage({
+            type: 'diagnosticSync',
+            latest: this._usageTracker.getLatestDiagnosticsByAccount(),
+        });
+    }
+    _writeStateDbKey(key, value) {
+        const dbPath = path.join(process.env.APPDATA || '', 'Windsurf/User/globalStorage/state.vscdb');
+        const sqlitePath = path.join(vscode.env.appRoot, 'node_modules/@vscode/sqlite3');
+        return new Promise((resolve, reject) => {
+            try {
+                const sqlite = require(sqlitePath);
+                const db = new sqlite.Database(dbPath, (err) => {
+                    if (err) {
+                        reject(err);
+                        return;
+                    }
+                    db.run('INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)', [key, value], (e) => {
+                        db.close();
+                        if (e)
+                            reject(e);
+                        else
+                            resolve();
+                    });
+                });
+            }
+            catch (e) {
+                reject(e);
+            }
+        });
+    }
+    /**
+     * 从 windsurfConfigurations protobuf 中提取 label → UID 映射
+     * UID 格式: lowercase-kebab-case (如 claude-opus-4-7)
+     * Label 格式: Title Case (如 Claude Opus 4.7)
+     */
+    async _extractModelUidMapping() {
+        const raw = await this._readStateDbKey('windsurfConfigurations');
+        if (!raw)
+            return new Map();
+        const buf = Buffer.from(raw, 'base64');
+        const text = buf.toString('utf8');
+        const mapping = new Map();
+        // 提取 labels (Title Case)
+        const labels = [];
+        const labelRe = /(?:Claude|GPT|SWE|Gemini|Grok|DeepSeek|Llama|Qwen|Mistral)[\w\s.\-()]+/g;
+        let m;
+        while ((m = labelRe.exec(text)) !== null) {
+            const name = m[0].trim();
+            if (name.length > 3 && name.length < 50 && !/_/.test(name))
+                labels.push(name);
+        }
+        // 提取 UIDs (lowercase-kebab-case)
+        const uids = new Set();
+        const uidRe = /\b(claude|gpt|swe|gemini|grok|deepseek|llama|qwen|mistral)[-a-z0-9]+/g;
+        while ((m = uidRe.exec(text)) !== null) {
+            const uid = m[0];
+            if (uid.length > 3 && uid.includes('-'))
+                uids.add(uid);
+        }
+        // 建立映射: 通过规范化文本匹配
+        for (const label of labels) {
+            const labelNorm = label.replace(/[.\-\s]/g, ' ').toLowerCase().trim();
+            for (const uid of uids) {
+                const uidNorm = uid.replace(/-/g, ' ');
+                if (uidNorm === labelNorm || labelNorm.includes(uidNorm) || uidNorm.includes(labelNorm)) {
+                    mapping.set(label, uid);
+                    break;
+                }
+            }
+        }
+        return mapping;
+    }
+    /**
+     * 切换模型：后端静默写入 state DB（持久化兜底），然后通过 bridge 执行 DOM 切换（立即生效）
+     * bridge 结果由全局 onBridgeResult handler 推送给 webview，不产生竞态
+     */
+    async _handleSwitchModel(cmdId, targetLabel) {
+        if (!targetLabel) {
+            this.postMessage({ type: 'enhCommandResult', result: {
+                    id: cmdId, action: 'test-switch-model', status: 'error',
+                    message: '未指定模型'
+                } });
+            return;
+        }
+        // 1. 静默写入 state DB（不阻塞，不影响 bridge 结果）
+        this._writeSwitchModelToDb(targetLabel).catch(err => {
+            this.log(`[switchModel] DB 写入失败（降级）: ${err}`);
+        });
+        // 2. 通过 bridge 执行 DOM 切换（bridge 结果由全局 handler 推送 webview）
+        (0, bridgeServer_1.enqueueCommand)({ id: cmdId, action: 'test-switch-model', payload: { model: targetLabel } });
+        // 3. 兜底超时：如果 bridge 8s 无响应，发送 DB 层面的成功
+        setTimeout(() => {
+            // 发一条 backup result（webview 会显示最后收到的结果）
+            this.postMessage({ type: 'enhCommandResult', result: {
+                    id: cmdId, action: 'test-switch-model', status: 'done',
+                    message: `已设置 ${targetLabel}（数据库已更新，新对话生效）`,
+                    newModel: targetLabel
+                } });
+        }, 8000);
+    }
+    /** 静默写入目标模型到 state DB */
+    async _writeSwitchModelToDb(targetLabel) {
+        const uidMap = await this._extractModelUidMapping();
+        let targetUid = uidMap.get(targetLabel) || '';
+        if (!targetUid) {
+            for (const [label, uid] of uidMap) {
+                const labelNorm = label.replace(/[.\-\s]/g, ' ').toLowerCase();
+                const targetNorm = targetLabel.replace(/[.\-\s]/g, ' ').toLowerCase();
+                if (labelNorm.includes(targetNorm) || targetNorm.includes(labelNorm)) {
+                    targetUid = uid;
+                    break;
+                }
+            }
+        }
+        if (!targetUid) {
+            targetUid = targetLabel.toLowerCase().replace(/\s+/g, '-').replace(/\./g, '-').replace(/[()]/g, '').replace(/--+/g, '-').replace(/-$/, '');
+        }
+        const codeiumRaw = await this._readStateDbKey('codeium.windsurf');
+        const state = codeiumRaw ? JSON.parse(codeiumRaw) : {};
+        const currentUids = state['windsurf.state.lastSelectedCascadeModelUids'] || [];
+        state['windsurf.state.lastSelectedCascadeModelUids'] = [targetUid, ...currentUids.filter((u) => u !== targetUid)];
+        await this._writeStateDbKey('codeium.windsurf', JSON.stringify(state));
+        this.log(`[switchModel] DB 已更新: uid=${targetUid}`);
+    }
+    async _readModelsFromStateDb() {
+        const raw = await this._readStateDbKey('windsurfConfigurations');
+        if (!raw)
+            return [];
+        // windsurfConfigurations 是 base64 编码的 protobuf 二进制
+        const buf = Buffer.from(raw, 'base64');
+        const text = buf.toString('utf8');
+        // 从二进制中提取可读的模型 label（过滤掉内部枚举名）
+        const models = new Set();
+        const re = /(?:Claude|GPT|SWE|Gemini|Grok|DeepSeek|Llama|Qwen|Mistral)[\w\s.\-()]+/g;
+        let m;
+        while ((m = re.exec(text)) !== null) {
+            const name = m[0].trim();
+            // 只保留 display label（排除 ENUM 格式如 GPT_5_2_HIGH）
+            if (name.length > 3 && name.length < 50 && !/_/.test(name)) {
+                models.add(name);
+            }
+        }
+        return [...models].sort();
+    }
+    /** 打开日志文件 */
+    async openLogFile() {
+        try {
+            const doc = await vscode.workspace.openTextDocument(this._logFilePath);
+            await vscode.window.showTextDocument(doc);
+        }
+        catch (err) {
+            this.showAlert('错误', '打开日志失败：' + err, 'error');
+        }
+    }
+    resolveWebviewView(webviewView) {
+        this._view = webviewView;
+        // 动态设置标题，包含版本号（容器已提供"Windsurf 号池管理:"前缀）
+        const extPkg = this._context.extension.packageJSON;
+        webviewView.title = extPkg.version || '';
+        webviewView.webview.options = {
+            enableScripts: true,
+            localResourceRoots: [
+                this._extensionUri
+            ]
+        };
+        webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
+        // bridge 信息首次推送（webview 会转发给 workbench renderer）
+        setTimeout(() => this.refreshBridgeInfo(), 500);
+        // 初始加载：先用 poolLastEmail 快速渲染，5s 后做 auth 检测
+        setTimeout(() => this.refresh(true), 300);
+        setTimeout(() => {
+            this.refresh();
+            this._pushAutoSwitchSettings();
+        }, 5000);
+        // 推送后端缓存和设置给 webview
+        setTimeout(() => {
+            this._pushCachedUsage();
+            this._pushAutoSwitchSettings();
+            this._pushEnhancementStatus();
+            this._pushUsageStats();
+            this._pushQuotaHistory();
+            // 恢复持久化的切号日志
+            const savedLogs = this._context.globalState.get('autoSwitchLogs', []);
+            if (savedLogs.length > 0) {
+                for (const log of savedLogs) {
+                    this.postMessage({ type: 'autoSwitchEvent', log });
+                }
+            }
+        }, 600);
+        // 监听 auth session 变化（Windsurf 登录/登出时触发）
+        try {
+            const sub = vscode.authentication.onDidChangeSessions((e) => {
+                if (e.provider.id === 'windsurf_auth')
+                    this.refresh();
+            });
+            this._disposables.push(sub);
+        }
+        catch { /* ignore */ }
+        // 监听共享账号文件变化（多实例同步）
+        try {
+            let debounceTimer;
+            const unwatch = accountStore.watchAccountsFile(() => {
+                if (debounceTimer)
+                    clearTimeout(debounceTimer);
+                debounceTimer = setTimeout(() => { this.refresh(); }, 300);
+            });
+            this._disposables.push({ dispose: unwatch });
+        }
+        catch { /* ignore */ }
+        // 监听 instances.json 变化（跨实例实时同步邮箱/状态）
+        try {
+            let instDebounce;
+            const unwatchInst = instanceManager.watchInstancesFile(() => {
+                if (instDebounce)
+                    clearTimeout(instDebounce);
+                instDebounce = setTimeout(async () => {
+                    try {
+                        const instances = await instanceManager.listInstances();
+                        this.postMessage({ type: 'instanceListResult', instances });
+                    }
+                    catch { }
+                }, 500);
+            });
+            this._disposables.push({ dispose: unwatchInst });
+        }
+        catch { /* ignore */ }
+        webviewView.onDidChangeVisibility(() => {
+            if (webviewView.visible) {
+                this.refresh();
+                this._pushAutoSwitchSettings();
+                this._pushEnhancementStatus();
+                this._pushUsageStats();
+                this._pushQuotaHistory();
+                this.refreshBridgeInfo();
+            }
+        });
+        // 监听 webview 消息
+        webviewView.webview.onDidReceiveMessage(async (message) => {
+            await this.handleMessage(message);
+        });
+    }
+    /** 推送后端缓存的所有 usage 数据给 webview */
+    _pushCachedUsage() {
+        for (const [email, entry] of this._autoSwitcher.getAllCached()) {
+            this.postMessage({ type: 'usage', email, snapshot: entry.snapshot, error: entry.error });
+            // 初始化额度基线，避免重启后需要两个刷新周期才能检测额度减少
+            if (entry.snapshot && !this._lastUsagePercent.has(email)) {
+                this._lastUsagePercent.set(email, entry.snapshot.dailyRemainingPercent);
+            }
+        }
+    }
+    /** 推送用量统计给 webview */
+    _pushUsageStats() {
+        const summary = this._usageTracker.getSummary();
+        this.postMessage({ type: 'usageStatsSync', ...summary });
+    }
+    /** 推送配额变动历史给 webview */
+    _pushQuotaHistory(email) {
+        const currentEmail = this._context.globalState.get('lastEmail') || '';
+        const entries = this._usageTracker.getQuotaHistory(email, 100);
+        const emails = this._usageTracker.getHistoryEmails();
+        this.postMessage({ type: 'quotaHistorySync', entries, emails, currentEmail });
+    }
+    /** 推送 Windsurf 增强状态给 webview */
+    _pushEnhancementStatus() {
+        try {
+            const status = (0, enhancementInjector_1.getInjectionStatus)();
+            const enabled = vscode.workspace.getConfiguration('windsurfPool.enhancement').get('enabled', true);
+            const autoRecovery = vscode.workspace.getConfiguration('windsurfPool.enhancement').get('autoRecovery', true);
+            const ext = vscode.extensions.getExtension('local.windsurf-pool');
+            const extVersion = ext?.packageJSON?.version || '0.0.0';
+            const patchVersion = status.patchVersion || '0.0.0';
+            const bubbleRulesInjected = (0, rulesInjector_1.hasBubbleRules)();
+            const signalBridgeActive = status.injected;
+            this.postMessage({
+                type: 'enhancementStatus',
+                injected: status.injected,
+                patchVersion,
+                extensionVersion: extVersion,
+                enabled,
+                autoRecovery,
+                bubbleRulesInjected,
+                signalBridgeActive,
+            });
+        }
+        catch { }
+    }
+    /** 防重播放通知声音：5 秒内只允许一次（bridge + webview 可能对同一事件双触发） */
+    _playNotifyOnce(tone, repeat, customTone, audioFile, sound = true, desktop = false, title, body) {
+        const now = Date.now();
+        if (now - this._lastSoundTs < 3000)
+            return; // 3s 内去重
+        this._lastSoundTs = now;
+        if (sound) {
+            (0, soundPlayer_1.playSystemSound)(tone, repeat, customTone, audioFile);
+        }
+        if (desktop) {
+            vscode.window.showInformationMessage(title || 'Cascade 完成', body || 'AI 回复已完成');
+        }
+    }
+    /** 推送自动切号设置给 webview + 同步 enabled 状态到 windsurf-better.js */
+    _pushAutoSwitchSettings() {
+        const s = this._autoSwitcher.settings;
+        this.postMessage({ type: 'autoSwitchSettingsSync', ...s });
+        // 同步 autoSwitchEnabled 给 DOM 侧，关闭时 windsurf-better.js 不再发送切号信号
+        try {
+            (0, bridgeServer_1.enqueueCommand)({ id: Date.now(), action: 'apply-settings', payload: { autoSwitchEnabled: s.enabled } });
+        }
+        catch { }
+    }
+    /**
+     * 处理 webview 消息
+     */
+    async handleMessage(message) {
+        switch (message.type) {
+            case 'enhLoad': {
+                // webview 启动时拉取磁盘上的真相源
+                const settings = (0, enhSettingsStore_1.readEnhSettings)();
+                this.postMessage({ type: 'enhLoaded', settings });
+                // 推送 globalState 中的标签颜色（跨实例同步）
+                const savedTagColors = this._context.globalState.get('tagColors');
+                if (savedTagColors && Object.keys(savedTagColors).length > 0) {
+                    this.postMessage({ type: 'tagColorsSync', colors: savedTagColors });
+                }
+                return;
+            }
+            case 'requestBridgeInfo': {
+                // sidebar webview 启动后主动拉取，避免与 extension 推送竞态
+                this.refreshBridgeInfo();
+                return;
+            }
+            case 'enhCommand': {
+                // webview 触发命令 → 塞 bridge 队列，等 windsurf-better.js 来轮询取走执行
+                const m = message;
+                if (m.id != null && m.action) {
+                    this.log(`[enhCommand] → 入队 action=${m.action} id=${m.id}`);
+                    // 特殊处理：后端直接处理，不经过 bridge
+                    if (m.action === 'fetch-models') {
+                        this._handleFetchModels(m.id);
+                    }
+                    else if (m.action === 'test-switch-model') {
+                        this._handleSwitchModel(m.id, m.payload?.model);
+                    }
+                    else {
+                        (0, bridgeServer_1.enqueueCommand)({ id: m.id, action: m.action, payload: m.payload || {} });
+                    }
+                }
+                else {
+                    this.log(`[enhCommand] ✗ 字段缺失 id=${message.id} action=${message.action}`);
+                }
+                return;
+            }
+            case 'enhSave': {
+                // webview 改了设置 → 写盘 + 重写 workbench.html（下次启动用）+ 通过桥实时推送给 windsurf-better.js
+                const patch = message.settings || {};
+                const merged = (0, enhSettingsStore_1.mergeEnhSettings)(patch);
+                // 重新注入 workbench.html（保证下次启动也是新值）
+                try {
+                    (0, enhancementInjector_1.ensureEnhancement)();
+                }
+                catch (err) {
+                    console.warn('[windsurf-pool] re-inject after enhSave failed:', err);
+                }
+                // 通过桥实时推送 apply-settings 命令给 windsurf-better.js
+                // 这样改设置无需 reload，立即生效（启停 observer / 还原汉化 / 切换 bubbles 主题等）
+                try {
+                    (0, bridgeServer_1.enqueueCommand)({ id: Date.now(), action: 'apply-settings', payload: merged });
+                }
+                catch (err) {
+                    console.warn('[windsurf-pool] bridge push apply-settings failed:', err);
+                }
+                // 回传保存结果（webview 显示"已实时应用"toast）
+                this.postMessage({ type: 'enhSaved', settings: merged });
+                // 通知状态栏重新读取配置并重绘
+                try {
+                    vscode.commands.executeCommand('windsurfPool.statusBarRefresh');
+                }
+                catch { /* ignore */ }
+                return;
+            }
+            case 'enhForceStop': {
+                // 强制停止：发送 force-stop 命令给注入脚本
+                try {
+                    (0, bridgeServer_1.enqueueCommand)({ id: Date.now(), action: 'force-stop', payload: {} });
+                }
+                catch (err) {
+                    console.warn('[windsurf-pool] bridge push force-stop failed:', err);
+                }
+                return;
+            }
+            case 'loginSave': {
+                const { email, password, batch, authMethod, tag } = message;
+                if (!email || !password) {
+                    if (!batch) {
+                        this.showAlert('提示', '请输入邮箱和密码', 'warn');
+                    }
+                    return;
+                }
+                const doLogin = async () => {
+                    const result = await (0, loginService_1.login)(email, password, authMethod || 'auto');
+                    if (result.ok && result.value) {
+                        if (tag) {
+                            result.value.tag = tag;
+                            result.value.tags = [tag];
+                        }
+                        await accountStore.upsertAccount(this._context, result.value);
+                        if (batch) {
+                            this.postMessage({ type: 'batchResult', ok: true, email });
+                            this.refresh();
+                        }
+                        else {
+                            this.showAlert('登录成功', '已登录并保存：' + email, 'info');
+                            this.refresh();
+                        }
+                    }
+                    else {
+                        if (!batch) {
+                            this.showAlert('登录失败', (result.error || '登录失败') + '：' + email, 'error');
+                        }
+                        else {
+                            this.postMessage({ type: 'batchResult', ok: false, email, error: result.error });
+                        }
+                    }
+                };
+                if (batch) {
+                    await doLogin();
+                }
+                else {
+                    await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '登录中… ' + email, cancellable: false }, doLogin);
+                }
+                break;
+            }
+            case 'switch': {
+                const { email } = message;
+                if (!email)
+                    return;
+                this.log(`[switch][trigger] 手动切号(webview): → ${email}`);
+                const accounts = await accountStore.readAccounts(this._context);
+                const account = accounts.find(a => a.email === email);
+                if (!account) {
+                    this.showAlert('提示', '账号不存在', 'warn');
+                    return;
+                }
+                const prevEmail = this._context.globalState.get('lastEmail') || '';
+                const isForce = !!message.force;
+                if (isForce) {
+                    this.log(`[switch][trigger] 强制切号(跨窗口抢占): → ${email}`);
+                }
+                const success = await (0, sessionInjector_1.injectSession)(this._context, account);
+                if (success) {
+                    this.postMessage({ type: 'switchResult', email, ok: true });
+                    this._recordDiagnostic(email, 'switch', true, '切换成功');
+                    (0, healthCheckPanel_1.clearHealthResult)(email);
+                    this._recordDiagnostic(email, 'health', true, '切换成功，测活已清除');
+                    this.postMessage({ type: 'testModelResult', email, ok: true, reason: '切换成功，测活已清除', ts: Date.now() });
+                    this._usageTracker.recordSwitch(email);
+                    // 跨窗口锁：释放旧号，锁定新号（强制切号时会覆写其他实例的锁）
+                    if (prevEmail)
+                        (0, accountLock_1.releaseLock)(prevEmail);
+                    (0, accountLock_1.acquireLock)(email);
+                    await accountStore.setCurrentAccount(this._context, email);
+                    const log = `[${this._tsFmt()}][manual${isForce ? '/force' : ''}] ${prevEmail} → ${email}`;
+                    this._recordSwitchLog(log, `${isForce ? '强制' : '手动'}切号 → ${email}`);
+                    // 无感切号：成功不弹任何提示，UI 高亮自动转移即为反馈
+                    this.refresh();
+                    this.onManualSwitch?.();
+                }
+                else {
+                    const failure = (0, sessionInjector_1.getLastInjectFailure)(email);
+                    const reason = failure?.reason || '未知原因';
+                    const title = failure?.kind === 'blocked' ? '账号暂不可用' : '切换失败';
+                    this.postMessage({ type: 'switchResult', email, ok: false, reason, kind: failure?.kind || 'error', ts: Date.now() });
+                    this._recordDiagnostic(email, 'switch', false, reason);
+                    if (failure?.kind !== 'blocked') {
+                        this.showAlert(title, `${email}\n${reason}`, 'error');
+                    }
+                }
+                break;
+            }
+            case 'delete': {
+                const { email } = message;
+                if (!email)
+                    return;
+                const deleted = await accountStore.removeAccount(this._context, email);
+                if (deleted) {
+                    this.refresh();
+                }
+                break;
+            }
+            case 'batchDelete': {
+                const { emails } = message;
+                if (!emails || !emails.length)
+                    return;
+                const removed = await accountStore.batchRemove(this._context, emails);
+                if (removed > 0) {
+                    this.refresh();
+                }
+                break;
+            }
+            case 'updateTag': {
+                const { email } = message;
+                if (!email)
+                    return;
+                const tags = message.tags;
+                if (Array.isArray(tags)) {
+                    await accountStore.updateTags(this._context, email, tags);
+                }
+                else {
+                    await accountStore.updateTag(this._context, email, message.tag || '');
+                }
+                this.refresh(true);
+                break;
+            }
+            case 'toggleDisabled': {
+                const { email } = message;
+                if (!email)
+                    return;
+                await accountStore.toggleDisabled(this._context, email);
+                this.refresh(true);
+                break;
+            }
+            case 'batchEnable': {
+                const { emails } = message;
+                if (!emails || !emails.length)
+                    return;
+                await accountStore.batchSetDisabled(this._context, emails, false);
+                this.refresh();
+                break;
+            }
+            case 'batchDisable': {
+                const { emails } = message;
+                if (!emails || !emails.length)
+                    return;
+                await accountStore.batchSetDisabled(this._context, emails, true);
+                this.refresh();
+                break;
+            }
+            case 'batchTag': {
+                const { emails } = message;
+                if (!emails || !emails.length)
+                    return;
+                const tags = message.tags;
+                if (Array.isArray(tags)) {
+                    await accountStore.batchUpdateTags(this._context, emails, tags);
+                }
+                else {
+                    await accountStore.batchUpdateTag(this._context, emails, message.tag || '');
+                }
+                this.refresh();
+                break;
+            }
+            case 'syncTagColors': {
+                const colors = message.colors;
+                if (colors && typeof colors === 'object') {
+                    // 持久化到 globalState（跨窗口共享）
+                    this._context.globalState.update('tagColors', colors);
+                    (0, healthCheckPanel_1.setTagColors)(colors);
+                }
+                break;
+            }
+            case 'clearHealthRateLimit': {
+                // webview 端基于配额或 contextMonitor 判定限速可清除，同步到扩展端 cache
+                // 避免下次扩展端推送时被覆盖回限速状态
+                const { email, reason } = message;
+                if (!email)
+                    break;
+                const hcCache = (0, healthCheckPanel_1.getHealthCheckCache)();
+                const hc = hcCache.get(email);
+                if (hc && !hc.ok) {
+                    hcCache.set(email, { ...hc, ok: true, reason: reason || '限速已自动解除', ts: Date.now() });
+                }
+                break;
+            }
+            case 'fetchUsageFor': {
+                const { email } = message;
+                if (!email)
+                    return;
+                // 优先返回后端缓存（60s 内有效）
+                const cached = this._autoSwitcher.getCached(email);
+                if (cached && Date.now() - cached.ts < 60000) {
+                    this.postMessage({ type: 'usage', email, snapshot: cached.snapshot, error: cached.error });
+                    break;
+                }
+                // 缓存过期：后端刷新（结果通过 onUsageUpdate 回调推送）
+                await this._autoSwitcher.refreshSingle(email, true);
+                break;
+            }
+            case 'refreshAllUsage': {
+                const force = message.force !== false;
+                this._autoSwitcher.refreshAll(force).catch(err => this.log(`[refreshAllUsage] error: ${err}`));
+                break;
+            }
+            case 'getUsageStats': {
+                this._pushUsageStats();
+                break;
+            }
+            case 'getQuotaHistory': {
+                this._pushQuotaHistory(message.email);
+                break;
+            }
+            case 'openLogPanel': {
+                vscode.commands.executeCommand('windsurfPool.openLogPanel', message.tab);
+                break;
+            }
+            case 'syncRecoveryLogs': {
+                const logs = message.logs;
+                if (Array.isArray(logs)) {
+                    this._context.globalState.update('recoveryLogs', logs);
+                }
+                break;
+            }
+            case 'syncDiagnoseLogs': {
+                const logs = message.logs;
+                if (Array.isArray(logs)) {
+                    this._context.globalState.update('diagnoseLogs', logs);
+                }
+                break;
+            }
+            case 'testModel': {
+                const { email, modelKey } = message;
+                if (!email)
+                    return;
+                this.postMessage({ type: 'testModelResult', email, ok: false, reason: '检测中...', testing: true });
+                const result = await (0, healthCheckPanel_1.testSingleAccount)(this._context, email, modelKey);
+                const cache = (0, healthCheckPanel_1.getHealthCheckCache)().get(email);
+                this.postMessage({ type: 'testModelResult', email, ok: result.ok, reason: result.reason, ts: cache?.ts });
+                this._recordDiagnostic(email, 'health', result.ok, result.reason, modelKey || 'Claude Sonnet 4.6', cache?.status);
+                break;
+            }
+            case 'testModelAll': {
+                const { modelKey: mKey, modelLabel: mLabel } = message;
+                const model = mKey ? { label: mLabel || mKey, uid: mKey } : undefined;
+                this._healthCheckAbort = new AbortController();
+                const hcSignal = this._healthCheckAbort.signal;
+                (0, usageService_1.setCascadeProbeEnabled)(true);
+                const accounts = await accountStore.readAccounts(this._context);
+                const targets = accounts.filter(a => !a.disabled);
+                for (const acc of targets) {
+                    if (hcSignal.aborted)
+                        break;
+                    this.postMessage({ type: 'testModelResult', email: acc.email, ok: false, reason: '检测中...', testing: true });
+                    try {
+                        const result = await (0, usageService_1.testModelAccess)(acc, model, hcSignal);
+                        if (hcSignal.aborted)
+                            break;
+                        const hcCache = (0, healthCheckPanel_1.getHealthCheckCache)();
+                        hcCache.set(acc.email, { ok: result.ok, reason: result.reason, status: result.status, ts: Date.now() });
+                        this.postMessage({ type: 'testModelResult', email: acc.email, ok: result.ok, reason: result.reason, ts: Date.now() });
+                        this._recordDiagnostic(acc.email, 'health', result.ok, result.reason, model?.label || model?.uid || 'Claude Sonnet 4.6', result.status);
+                    }
+                    catch (err) {
+                        if (hcSignal.aborted)
+                            break;
+                        const reason = `异常: ${err?.message || err}`;
+                        this.postMessage({ type: 'testModelResult', email: acc.email, ok: false, reason, ts: Date.now() });
+                        this._recordDiagnostic(acc.email, 'health', false, reason, model?.label || model?.uid || 'Claude Sonnet 4.6');
+                    }
+                }
+                this._healthCheckAbort = undefined;
+                (0, usageService_1.setCascadeProbeEnabled)(false);
+                (0, cascadeProbe_1.stopIsolatedCascadeProbeLs)();
+                (0, acpRecovery_1.scheduleAcpConnectionRecovery)('sidebar-health-check-done', 1500);
+                this.postMessage({ type: 'testModelAllDone' });
+                break;
+            }
+            case 'stopHealthCheck': {
+                this._healthCheckAbort?.abort();
+                break;
+            }
+            case 'savePoolTags': {
+                const m = message;
+                const tags = m.poolTags || [];
+                await this._context.globalState.update('as.poolTags', tags);
+                this.postMessage({ type: 'poolTagsSaved', poolTags: tags });
+                break;
+            }
+            case 'autoSwitchSettings': {
+                const m = message;
+                await this._autoSwitcher.updateSettings({
+                    enabled: m.enabled,
+                    threshold: m.threshold,
+                    checkSec: m.checkSec,
+                    cooldownSec: m.cooldownSec,
+                    refreshMin: m.refreshMin,
+                    refreshConcurrency: m.refreshConcurrency,
+                    refreshBatchDelayMs: m.refreshBatchDelayMs,
+                    periodRefreshHours: m.periodRefreshHours,
+                    scoreMode: m.scoreMode,
+                    switchStrategy: m.switchStrategy,
+                    minQuota: m.minQuota,
+                    preferUsedThreshold: m.preferUsedThreshold,
+                    poolScope: m.poolScope,
+                    poolTags: m.poolTags,
+                });
+                this._pushAutoSwitchSettings();
+                break;
+            }
+            case 'batchLogin': {
+                const { email, password, authMethod } = message;
+                if (!email || !password)
+                    return;
+                const result = await (0, loginService_1.login)(email, password, authMethod || 'auto');
+                if (result.ok && result.value) {
+                    await accountStore.upsertAccount(this._context, result.value);
+                    this.postMessage({
+                        type: 'batchResult',
+                        ok: true,
+                        email
+                    });
+                }
+                else {
+                    this.postMessage({
+                        type: 'batchResult',
+                        ok: false,
+                        email,
+                        error: result.error
+                    });
+                }
+                break;
+            }
+            case 'batchTokenImport': {
+                const token = message.token;
+                if (!token)
+                    return;
+                const tokenResult = await (0, loginService_1.loginByAuth1Token)(token);
+                if (tokenResult.ok && tokenResult.value) {
+                    if (message.tag) {
+                        tokenResult.value.tag = message.tag;
+                        tokenResult.value.tags = [message.tag];
+                    }
+                    await accountStore.upsertAccount(this._context, tokenResult.value);
+                    this.postMessage({ type: 'batchResult', ok: true, email: tokenResult.value.email });
+                    this.refresh();
+                }
+                else {
+                    this.postMessage({ type: 'batchResult', ok: false, email: token.substring(0, 20) + '...', error: tokenResult.error });
+                }
+                break;
+            }
+            case 'batchRefreshTokenImport': {
+                const raw = message.account || {};
+                const email = String(raw.email || '').trim();
+                const refreshToken = String(raw.refreshToken || '').trim();
+                if (!email || !refreshToken) {
+                    this.postMessage({ type: 'batchResult', ok: false, email: email || 'Refresh Token', error: '缺少 email 或 refreshToken' });
+                    return;
+                }
+                const imported = await this.importByRefreshToken(email, refreshToken);
+                if (imported.ok && imported.value) {
+                    if (raw.tag) {
+                        imported.value.tag = raw.tag;
+                        imported.value.tags = raw.tags || [raw.tag];
+                    }
+                    await accountStore.upsertAccount(this._context, imported.value);
+                    this.postMessage({ type: 'batchResult', ok: true, email });
+                    this.refresh();
+                }
+                else {
+                    this.postMessage({ type: 'batchResult', ok: false, email, error: imported.error || 'Refresh Token 导入失败' });
+                }
+                break;
+            }
+            case 'batchStoredAccountImport': {
+                const raw = message.account || {};
+                const email = String(raw.email || '').trim();
+                const apiKey = String(raw.apiKey || '').trim();
+                const apiServerUrl = String(raw.apiServerUrl || '').trim() || 'https://server.self-serve.windsurf.com';
+                if (!email || !apiKey) {
+                    this.postMessage({ type: 'batchResult', ok: false, email: email || '账号配置', error: '缺少 email 或 apiKey' });
+                    return;
+                }
+                await accountStore.upsertAccount(this._context, {
+                    email,
+                    apiKey,
+                    apiServerUrl,
+                    name: raw.name,
+                    tag: raw.tag,
+                    tags: raw.tags || (raw.tag ? [raw.tag] : undefined),
+                    disabled: raw.disabled === true ? true : undefined,
+                });
+                this.postMessage({ type: 'batchResult', ok: true, email });
+                this.refresh();
+                break;
+            }
+            case 'serverImport': {
+                await this.handleServerImport(message);
+                break;
+            }
+            case 'copyEmail': {
+                const email = String(message.email || '').trim();
+                if (email) {
+                    await vscode.env.clipboard.writeText(email);
+                }
+                break;
+            }
+            case 'exportAccounts': {
+                const accounts = await accountStore.readAccounts(this._context);
+                const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+                const payload = {
+                    type: 'windsurf-pool-accounts',
+                    version: 1,
+                    exportedAt: new Date().toISOString(),
+                    accounts,
+                };
+                const text = JSON.stringify(payload, null, 2);
+                try {
+                    await vscode.env.clipboard.writeText(text);
+                }
+                catch { }
+                const uri = await vscode.window.showSaveDialog({
+                    defaultUri: vscode.Uri.file(path.join(process.env.USERPROFILE || '', 'Desktop', `windsurf-pool-accounts-${stamp}.json`)),
+                    filters: { JSON: ['json'] },
+                    saveLabel: '导出账号设置',
+                });
+                if (!uri) {
+                    this.postMessage({ type: 'exportAccountsResult', ok: true, copied: true, saved: false, count: accounts.length, message: `已复制 ${accounts.length} 个账号到剪贴板` });
+                    break;
+                }
+                await fs.promises.writeFile(uri.fsPath, text, 'utf8');
+                this.postMessage({ type: 'exportAccountsResult', ok: true, copied: true, saved: true, count: accounts.length, path: uri.fsPath, message: `已导出 ${accounts.length} 个账号` });
+                break;
+            }
+            case 'oauthLogin': {
+                this.postMessage({ type: 'oauthStatus', phase: 'opening', message: '正在打开 Windsurf OAuth 授权页…' });
+                try {
+                    const account = await (0, windsurfOAuthService_1.loginByWindsurfOAuth)();
+                    const oauthTag = message.tag;
+                    if (oauthTag) {
+                        account.tag = oauthTag;
+                        account.tags = [oauthTag];
+                    }
+                    await accountStore.upsertAccount(this._context, account);
+                    this.postMessage({ type: 'oauthStatus', ok: true, email: account.email, message: `OAuth 导入成功：${account.email}` });
+                    this.refresh();
+                }
+                catch (err) {
+                    this.postMessage({ type: 'oauthStatus', ok: false, message: err?.message || String(err) });
+                }
+                break;
+            }
+            case 'runCommand': {
+                const { command } = message;
+                if (command) {
+                    vscode.commands.executeCommand(command);
+                }
+                break;
+            }
+            case 'openExternal': {
+                const { url } = message;
+                if (url) {
+                    vscode.env.openExternal(vscode.Uri.parse(url));
+                }
+                break;
+            }
+            case 'addCurrent': {
+                await this.handleAddCurrent();
+                break;
+            }
+            case 'alertResponse': {
+                const cb = this._alertCallbacks.get(message.id);
+                if (cb) {
+                    this._alertCallbacks.delete(message.id);
+                    cb(message.action ?? null);
+                }
+                break;
+            }
+            case 'getEnhancementStatus': {
+                this._pushEnhancementStatus();
+                break;
+            }
+            case 'resetMachineId': {
+                await (0, healthCheckPanel_1.resetMachineId)();
+                break;
+            }
+            case 'toggleEnhancement': {
+                const current = vscode.workspace.getConfiguration('windsurfPool.enhancement').get('enabled', true);
+                const next = !current;
+                await vscode.workspace.getConfiguration('windsurfPool.enhancement').update('enabled', next, vscode.ConfigurationTarget.Global);
+                // 真正启用/关闭：操作文件而非仅改配置
+                const { ensureEnhancement, restoreWorkbench } = await Promise.resolve().then(() => __importStar(require('./enhancementInjector')));
+                const { injectBubbleRules, removeBubbleRules, injectScriptDisciplineRules, removeScriptDisciplineRules } = await Promise.resolve().then(() => __importStar(require('./rulesInjector')));
+                let fileChanged = false;
+                try {
+                    if (next) {
+                        // 启用：注入 workbench.html + 注入增强相关规则（气泡+脚本纪律）
+                        const r = ensureEnhancement();
+                        if (r.injected && r.needRestart)
+                            fileChanged = true;
+                        injectBubbleRules();
+                        injectScriptDisciplineRules();
+                    }
+                    else {
+                        // 关闭：恢复 workbench.html + 移除增强相关规则
+                        if (restoreWorkbench())
+                            fileChanged = true;
+                        removeBubbleRules();
+                        removeScriptDisciplineRules();
+                    }
+                }
+                catch (err) {
+                    console.error('[windsurf-pool] toggleEnhancement file op failed:', err);
+                }
+                this._pushEnhancementStatus();
+                const label = next ? '已启用' : '已关闭';
+                const msg = fileChanged
+                    ? `Windsurf 增强${label}，需要重载窗口才能生效。`
+                    : `Windsurf 增强${label}。`;
+                const action = await vscode.window.showInformationMessage(msg, '立即重载');
+                if (action === '立即重载') {
+                    vscode.commands.executeCommand('workbench.action.reloadWindow');
+                }
+                break;
+            }
+            // ── 多实例管理 ──
+            case 'instanceList': {
+                try {
+                    const instances = await instanceManager.listInstances();
+                    // 将当前窗口的活跃账号同步到 instances.json（供其他窗口读取）
+                    const currentEmail = this._context.globalState.get('lastEmail') || '';
+                    if (currentEmail) {
+                        const myInst = instances.find(i => i.current);
+                        if (myInst && myInst.bindEmail === '__auto__' && !myInst.currentEmail) {
+                            myInst.currentEmail = currentEmail;
+                        }
+                        if (myInst && myInst.bindEmail !== currentEmail && myInst.bindEmail !== '__auto__') {
+                            myInst.bindEmail = currentEmail;
+                            instanceManager.syncCurrentInstanceEmail(currentEmail);
+                        }
+                    }
+                    const hasUnimported = instanceManager.hasUnimportedCockpitInstances();
+                    this.postMessage({ type: 'instanceListResult', instances, hasUnimported });
+                }
+                catch (err) {
+                    this.postMessage({ type: 'instanceError', error: String(err) });
+                }
+                break;
+            }
+            case 'instanceCreate': {
+                const { instanceName, email, assignedTag } = message;
+                if (!instanceName || !email) {
+                    this.postMessage({ type: 'instanceError', error: '名称和绑定账号不能为空' });
+                    return;
+                }
+                try {
+                    this.postMessage({ type: 'instanceProgress', message: '正在复制 Windsurf 数据目录…' });
+                    const newInst = await instanceManager.createInstance({
+                        name: instanceName,
+                        bindEmail: email,
+                        onProgress: (msg) => {
+                            this.postMessage({ type: 'instanceProgress', message: msg });
+                        }
+                    });
+                    if (assignedTag) {
+                        try {
+                            instanceManager.updateInstanceTag(newInst.id, assignedTag);
+                        }
+                        catch (e) {
+                            console.warn('[instanceCreate] set tag failed:', e);
+                        }
+                    }
+                    this.postMessage({ type: 'instanceProgress', message: '实例创建完成', done: true });
+                    // 刷新列表
+                    const instances = await instanceManager.listInstances();
+                    this.postMessage({ type: 'instanceListResult', instances });
+                }
+                catch (err) {
+                    this.postMessage({ type: 'instanceProgress', message: String(err), done: true, error: true });
+                }
+                break;
+            }
+            case 'instanceDelete': {
+                const { instanceId } = message;
+                if (!instanceId)
+                    return;
+                try {
+                    instanceManager.deleteInstance(instanceId);
+                    const instances = await instanceManager.listInstances();
+                    this.postMessage({ type: 'instanceListResult', instances });
+                }
+                catch (err) {
+                    this.postMessage({ type: 'instanceError', error: String(err) });
+                }
+                break;
+            }
+            case 'instanceStart': {
+                const { instanceId } = message;
+                if (!instanceId)
+                    return;
+                try {
+                    this.postMessage({ type: 'instanceProgress', message: '正在启动实例…' });
+                    await instanceManager.startInstance(instanceId);
+                    this.postMessage({ type: 'instanceProgress', message: '实例已启动 ✓', done: true });
+                    // 稍等后刷新状态（让进程完全启动）
+                    setTimeout(async () => {
+                        try {
+                            const instances = await instanceManager.listInstances();
+                            this.postMessage({ type: 'instanceListResult', instances });
+                        }
+                        catch { }
+                    }, 3000);
+                }
+                catch (err) {
+                    this.postMessage({ type: 'instanceError', error: String(err) });
+                }
+                break;
+            }
+            case 'instanceFocus': {
+                const { instanceId } = message;
+                if (!instanceId)
+                    return;
+                try {
+                    await instanceManager.focusInstance(instanceId);
+                }
+                catch (err) {
+                    this.postMessage({ type: 'instanceError', error: String(err) });
+                }
+                break;
+            }
+            case 'instanceStop': {
+                const { instanceId } = message;
+                if (!instanceId)
+                    return;
+                try {
+                    this.postMessage({ type: 'instanceProgress', message: '正在优雅关闭实例…' });
+                    await instanceManager.stopInstance(instanceId);
+                    this.postMessage({ type: 'instanceProgress', message: '实例已停止', done: true });
+                    const instances = await instanceManager.listInstances();
+                    this.postMessage({ type: 'instanceListResult', instances });
+                }
+                catch (err) {
+                    this.postMessage({ type: 'instanceError', error: String(err) });
+                }
+                break;
+            }
+            case 'instanceUpdate': {
+                const { instanceId, instanceName, email, assignedTag } = message;
+                if (!instanceId)
+                    return;
+                try {
+                    if (instanceName) {
+                        instanceManager.updateInstanceName(instanceId, instanceName);
+                    }
+                    if (email) {
+                        instanceManager.updateInstanceBind(instanceId, email);
+                    }
+                    if (assignedTag !== undefined) {
+                        instanceManager.updateInstanceTag(instanceId, assignedTag || undefined);
+                    }
+                    const instances = await instanceManager.listInstances();
+                    this.postMessage({ type: 'instanceListResult', instances });
+                }
+                catch (err) {
+                    this.postMessage({ type: 'instanceError', error: String(err) });
+                }
+                break;
+            }
+            // ── Cockpit Tools 导入 ──
+            case 'cockpitList': {
+                try {
+                    const instances = instanceManager.listCockpitInstances();
+                    this.postMessage({ type: 'cockpitListResult', instances });
+                }
+                catch (err) {
+                    this.postMessage({ type: 'instanceError', error: String(err) });
+                }
+                break;
+            }
+            // ── 完成提醒：浏览音频文件 ──
+            case 'browseAudioFile': {
+                const uris = await vscode.window.showOpenDialog({
+                    canSelectMany: false,
+                    filters: { '音频文件': ['wav', 'mp3', 'ogg', 'flac'] },
+                    title: '选择提醒音频文件',
+                });
+                if (uris && uris.length > 0) {
+                    this.postMessage({ type: 'audioFileSelected', path: uris[0].fsPath });
+                }
+                break;
+            }
+            // ── 完成提醒：系统声音播放 ──
+            case 'playNotifySound': {
+                const d = message.data || {};
+                this._playNotifyOnce(d.tone || 'funk', d.repeat || 2, d.customTone, d.audioFile, d.sound !== false, !!d.desktop, d.title, d.body);
+                break;
+            }
+            // ── Windsurf 增强：信号桥接 ──
+            case 'poolSignal': {
+                const signal = message.data;
+                if (!signal || !signal.ts)
+                    break;
+                await (0, signalBridge_1.handlePoolSignal)(signal, this._autoSwitcher, (result) => {
+                    this.postMessage({ type: 'poolResult', data: result });
+                });
+                break;
+            }
+            case 'cockpitImport': {
+                const { cockpitId, instanceName, email } = message;
+                if (!cockpitId || !instanceName || !email) {
+                    this.postMessage({ type: 'instanceError', error: '参数不完整' });
+                    return;
+                }
+                try {
+                    this.postMessage({ type: 'instanceProgress', message: '正在导入 Cockpit 实例…' });
+                    await instanceManager.importCockpitInstance(cockpitId, instanceName, email);
+                    this.postMessage({ type: 'instanceProgress', message: '导入完成', done: true });
+                    const instances = await instanceManager.listInstances();
+                    this.postMessage({ type: 'instanceListResult', instances });
+                    // 刷新 Cockpit 列表中的 imported 状态
+                    const cockpitInstances = instanceManager.listCockpitInstances();
+                    this.postMessage({ type: 'cockpitListResult', instances: cockpitInstances });
+                }
+                catch (err) {
+                    this.postMessage({ type: 'instanceProgress', message: String(err), done: true, error: true });
+                }
+                break;
+            }
+        }
+    }
+    /**
+     * 从 Windsurf 当前已登录账户导入到号池
+     * 复用 detectCurrentWindsurfAccount 获取 session 信息
+     */
+    async handleAddCurrent() {
+        // 最多等待 15 秒，等 Windsurf 内置扩展就绪
+        let apiKey = '';
+        let accountLabel = '';
+        let detectedApiServerUrl = '';
+        let lastDiag;
+        for (let i = 0; i < 15; i++) {
+            const result = await this.detectCurrentWindsurfAccount();
+            apiKey = result.token;
+            accountLabel = result.label;
+            detectedApiServerUrl = result.apiServerUrl || '';
+            lastDiag = result.diag;
+            if (apiKey)
+                break;
+            await new Promise(r => setTimeout(r, 1000));
+        }
+        if (!apiKey) {
+            // 输出详细诊断到 OutputChannel
+            const d = lastDiag;
+            this.log(`[添加当前] 检测失败，诊断信息:`);
+            this.log(`  补丁命令已注册: ${d.patchRegistered}`);
+            this.log(`  补丁结果: ${d.patchResult}`);
+            this.log(`  Auth API: ${d.authLabel}`);
+            this.log(`  Session API: ${d.sessionResult}`);
+            // 生成用户可理解的具体原因
+            let reason;
+            if (!d.patchRegistered) {
+                reason = '补丁命令未注册 — 请先执行「应用补丁」并重启 Windsurf。';
+            }
+            else if (d.patchResult.startsWith('error') || d.patchResult.startsWith('exception')) {
+                reason = `补丁命令执行出错: ${d.patchResult}\n请尝试重新「应用补丁」并重启。`;
+            }
+            else if (d.patchResult === 'empty-response') {
+                reason = '补丁命令返回空 — 可能补丁版本不匹配，请重新「应用补丁」。';
+            }
+            else {
+                reason = 'Windsurf 账户 Session 尚未就绪 — 请确认已登录 Windsurf 账号，稍后再试。';
+            }
+            this.showConfirm('检测失败', reason, ['重试', '查看日志', '取消'], 'warn').then(action => {
+                if (action === '重试') {
+                    this.handleAddCurrent();
+                }
+                if (action === '查看日志') {
+                    this.showLog();
+                }
+            });
+            return;
+        }
+        const email = accountLabel.includes('@') ? accountLabel : (accountLabel || 'user') + '@windsurf.local';
+        // 检查是否重复
+        const existing = await accountStore.readAccounts(this._context);
+        const dup = existing.find(a => a.email === email);
+        if (dup) {
+            const action = await this.showConfirm('确认', `账号 ${email} 已在号池中，是否更新其 Session？`, ['更新', '取消'], 'warn');
+            if (action !== '更新')
+                return;
+        }
+        // 优先使用补丁命令返回的真实 apiServerUrl，回退到默认 codeium
+        const account = {
+            email,
+            apiKey,
+            apiServerUrl: detectedApiServerUrl || 'https://server.codeium.com',
+            name: accountLabel || ''
+        };
+        await accountStore.upsertAccount(this._context, account);
+        // 加入后设为当前账户（因为这就是 Windsurf 实际登录的号）
+        await accountStore.setCurrentAccount(this._context, email);
+        this.showAlert('添加成功', (dup ? '已更新并设为当前：' : '已添加并设为当前：') + email, 'info');
+        this.refresh();
+    }
+    /**
+     * 发送消息到 webview
+     */
+    postMessage(message) {
+        this._view?.webview.postMessage(message);
+    }
+    // 通用 webview 弹窗（无需回调）
+    showAlert(title, message, level = 'info') {
+        this._view?.webview.postMessage({ type: 'showAlert', title, message, level });
+    }
+    showConfirm(title, message, buttons, level = 'warn') {
+        return new Promise(resolve => {
+            const id = 'alert_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+            this._alertCallbacks.set(id, resolve);
+            this._view?.webview.postMessage({ type: 'showAlert', id, title, message, level, buttons });
+            // 超时兜底
+            setTimeout(() => {
+                if (this._alertCallbacks.has(id)) {
+                    this._alertCallbacks.delete(id);
+                    resolve(null);
+                }
+            }, 60000);
+        });
+    }
+    /**
+     * 检测 Windsurf 当前登录的账户（优先补丁命令，回退 auth API）
+     */
+    async detectCurrentWindsurfAccount() {
+        let token = '';
+        let label = '';
+        let apiServerUrl = '';
+        const diag = { patchRegistered: false, patchResult: '', authLabel: '', sessionResult: '' };
+        // 1. 补丁命令（最可靠，直接返回邮箱、apiKey 和 apiServerUrl）
+        try {
+            const cmds = await vscode.commands.getCommands(true);
+            if (cmds.includes('windsurf.exportCurrentSessionWithShit')) {
+                diag.patchRegistered = true;
+                const r = await vscode.commands.executeCommand('windsurf.exportCurrentSessionWithShit');
+                if (r && !r.error) {
+                    if (r.apiKey)
+                        token = r.apiKey;
+                    if (r.email)
+                        label = r.email;
+                    if (r.apiServerUrl)
+                        apiServerUrl = r.apiServerUrl;
+                    diag.patchResult = token ? 'ok' : `no-apiKey(email=${r.email || 'none'})`;
+                }
+                else {
+                    diag.patchResult = r?.error ? `error: ${r.error}` : 'empty-response';
+                }
+            }
+            else {
+                diag.patchResult = 'command-not-registered';
+            }
+        }
+        catch (e) {
+            diag.patchResult = `exception: ${e?.message || e}`;
+        }
+        // 2. getAccounts（VS Code 1.85+，兜底拿 label）
+        if (!label) {
+            try {
+                const api = vscode.authentication;
+                if (typeof api.getAccounts === 'function') {
+                    const accts = await api.getAccounts('windsurf_auth');
+                    if (accts?.length) {
+                        label = accts[0].label || accts[0].id || '';
+                        diag.authLabel = label || 'empty-label';
+                    }
+                    else {
+                        diag.authLabel = 'no-accounts';
+                    }
+                }
+                else {
+                    diag.authLabel = 'api-unavailable';
+                }
+            }
+            catch (e) {
+                diag.authLabel = `exception: ${e?.message || e}`;
+            }
+        }
+        else {
+            diag.authLabel = 'skipped(from-patch)';
+        }
+        // 3. getSession 多 scope 尝试（兜底拿 token）
+        if (!token) {
+            const scopeSets = [['login'], ['login', 'onboarding'], [], ['LOGIN']];
+            const failures = [];
+            for (const scopes of scopeSets) {
+                try {
+                    const s = await vscode.authentication.getSession('windsurf_auth', scopes, { createIfNone: false });
+                    if (s?.accessToken) {
+                        token = s.accessToken;
+                        if (!label)
+                            label = s.account.label || s.account.id || '';
+                        diag.sessionResult = `ok(scope=${JSON.stringify(scopes)})`;
+                        break;
+                    }
+                    else {
+                        failures.push(`[${scopes.join(',') || 'empty'}]:no-token`);
+                    }
+                }
+                catch (e) {
+                    failures.push(`[${scopes.join(',') || 'empty'}]:${e?.message || e}`);
+                }
+            }
+            if (!token)
+                diag.sessionResult = failures.join('; ') || 'all-scopes-failed';
+        }
+        else {
+            diag.sessionResult = 'skipped(from-patch)';
+        }
+        return { token, label, apiServerUrl, diag };
+    }
+    /**
+     * 刷新 webview
+     */
+    async refresh(skipAuth = false) {
+        if (!this._view)
+            return;
+        const accounts = await accountStore.readAccounts(this._context);
+        const poolLastEmail = this._context.globalState.get('lastEmail') || '';
+        let activeEmail = poolLastEmail;
+        let externalAccount = '';
+        if (!skipAuth) {
+            const { token: realToken, label: realLabel } = await this.detectCurrentWindsurfAccount();
+            if (realToken || realLabel) {
+                const tokenMatch = realToken ? accounts.find(a => a.apiKey === realToken) : null;
+                const emailMatch = realLabel ? accounts.find(a => a.email === realLabel ||
+                    a.name === realLabel ||
+                    a.email === realLabel + '@windsurf.local') : null;
+                const poolMatch = poolLastEmail ? accounts.find(a => a.email === poolLastEmail) : null;
+                if (tokenMatch) {
+                    activeEmail = tokenMatch.email;
+                }
+                else if (emailMatch) {
+                    activeEmail = emailMatch.email;
+                }
+                else if (realLabel && realLabel.includes('@')) {
+                    // 拿到真实邮箱且号池里没有 → 外部账户
+                    activeEmail = '';
+                    externalAccount = realLabel;
+                }
+                else if (poolMatch) {
+                    // realLabel 不是邮箱（如显示名）→ 回退 poolLastEmail
+                    activeEmail = poolMatch.email;
+                }
+                // 仅当 poolLastEmail 不在号池中（账号被删除等）时才允许覆盖
+                // 否则信任号池的 lastEmail（启动时已 re-inject，Windsurf 旧 auth 状态不应覆盖号池）
+                if (activeEmail && poolLastEmail !== activeEmail) {
+                    if (!poolMatch) {
+                        await accountStore.setCurrentAccount(this._context, activeEmail);
+                    }
+                    else {
+                        // 号池 lastEmail 仍有效，保持不变，用号池的值
+                        activeEmail = poolLastEmail;
+                    }
+                }
+            }
+        }
+        // 跨窗口锁：获取被其他窗口占用的账号
+        const lockedEmails = [...(0, accountLock_1.getOtherLockedEmails)()];
+        const lockedEmailsMap = (0, accountLock_1.getOtherLockedEmailsMap)();
+        this.postMessage({
+            type: 'accountsChanged',
+            accounts,
+            lastEmail: activeEmail,
+            externalAccount,
+            lockedEmails,
+            lockedEmailsMap
+        });
+        // 同步当前实例邮箱到 instances.json（refresh 后 activeEmail 才可靠）
+        if (activeEmail) {
+            try {
+                instanceManager.syncCurrentInstanceEmail(activeEmail);
+                const instances = await instanceManager.listInstances();
+                const myInst = instances.find(i => i.current);
+                if (myInst && !myInst.bindEmail) {
+                    myInst.bindEmail = activeEmail;
+                }
+                // __auto__ 模式下不覆盖显示值（卡片会显示"自动切号"）
+                this.postMessage({ type: 'instanceListResult', instances });
+            }
+            catch { }
+        }
+        // 推送已有的测活缓存，让卡片 badge 在刷新后保持
+        const hcCache = (0, healthCheckPanel_1.getHealthCheckCache)();
+        if (hcCache.size > 0) {
+            for (const [email, entry] of hcCache) {
+                this.postMessage({ type: 'testModelResult', email, ok: entry.ok, reason: entry.reason, ts: entry.ts });
+            }
+        }
+        this._pushDiagnosticSync();
+    }
+    async fetchServerAccounts(baseUrl, planType) {
+        const cleanBaseUrl = String(baseUrl || '').trim().replace(/\/+$/, '');
+        if (!cleanBaseUrl) {
+            throw new Error('请填写 API 地址');
+        }
+        const url = new URL(`${cleanBaseUrl}/accounts`);
+        url.searchParams.set('page', '1');
+        url.searchParams.set('page_size', '10000');
+        if (planType && planType !== 'All') {
+            url.searchParams.set('plan_names', planType);
+        }
+        const http = await Promise.resolve().then(() => __importStar(require('http')));
+        const https = await Promise.resolve().then(() => __importStar(require('https')));
+        const client = url.protocol === 'https:' ? https : http;
+        return await new Promise((resolve, reject) => {
+            const req = client.get(url, (res) => {
+                let data = '';
+                res.on('data', chunk => { data += chunk; });
+                res.on('end', () => {
+                    if (res.statusCode && res.statusCode >= 400) {
+                        reject(new Error(`HTTP ${res.statusCode}: ${data.substring(0, 200)}`));
+                        return;
+                    }
+                    try {
+                        const json = JSON.parse(data);
+                        resolve(Array.isArray(json.accounts) ? json.accounts : []);
+                    }
+                    catch (err) {
+                        reject(new Error(`响应 JSON 解析失败: ${err?.message || err}`));
+                    }
+                });
+            });
+            req.on('error', reject);
+            req.setTimeout(15000, () => {
+                req.destroy(new Error('请求超时 (15s)'));
+            });
+        });
+    }
+    buildServerImportItems(accounts, credType, tag) {
+        const items = [];
+        let skipped = 0;
+        for (const acc of accounts) {
+            const email = String(acc.email || '').trim();
+            if (!email) {
+                skipped++;
+                continue;
+            }
+            if (credType === 'password') {
+                const password = String(acc.password || '').trim();
+                if (!password) {
+                    skipped++;
+                    continue;
+                }
+                items.push({ email, password, authMethod: 'auto' });
+            }
+            else if (credType === 'refresh') {
+                const refreshToken = String(acc.refresh_token || acc.refreshToken || '').trim();
+                if (!refreshToken) {
+                    skipped++;
+                    continue;
+                }
+                items.push({ email, refreshToken });
+            }
+            else if (credType === 'apikey' || credType === 'session') {
+                const apiKey = String(acc.api_key || acc.apiKey || acc.devin_session_token || acc.devinSessionToken || '').trim();
+                if (!apiKey) {
+                    skipped++;
+                    continue;
+                }
+                items.push({
+                    email,
+                    apiKey,
+                    apiServerUrl: String(acc.api_server_url || acc.apiServerUrl || 'https://server.self-serve.windsurf.com').trim(),
+                    name: acc.name || acc.display_name || acc.displayName || email.split('@')[0],
+                });
+            }
+            else {
+                const token = String(acc.devin_auth1_token || acc.devinAuth1Token || '').trim();
+                if (!token) {
+                    skipped++;
+                    continue;
+                }
+                items.push({ email, token });
+            }
+        }
+        if (tag) {
+            for (const item of items) {
+                item.tag = tag;
+                item.tags = [tag];
+            }
+        }
+        return { items, skipped };
+    }
+    async handleServerImport(message) {
+        try {
+            const accounts = await this.fetchServerAccounts(message.baseUrl, message.planType || 'All');
+            const { items, skipped } = this.buildServerImportItems(accounts, message.credType || 'auth1', String(message.tag || '').trim());
+            this.postMessage({
+                type: 'serverImportResult',
+                ok: true,
+                accounts: items,
+                skipped,
+                message: items.length ? `获取到 ${items.length} 个可导入账号` : `获取到 ${accounts.length} 个账号，但没有匹配凭据`,
+            });
+        }
+        catch (err) {
+            this.postMessage({ type: 'serverImportResult', ok: false, error: err?.message || String(err) });
+        }
+    }
+    async importByRefreshToken(email, refreshToken) {
+        try {
+            const params = new URLSearchParams();
+            params.set('grant_type', 'refresh_token');
+            params.set('refresh_token', refreshToken);
+            const data = params.toString();
+            const url = `https://securetoken.googleapis.com/v1/token?key=${require('./config').FIREBASE_API_KEY}`;
+            const https = await Promise.resolve().then(() => __importStar(require('https')));
+            const tokenResp = await new Promise((resolve, reject) => {
+                const req = https.request(url, {
+                    method: 'POST',
+                    timeout: 15000,
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'Content-Length': Buffer.byteLength(data),
+                    },
+                }, (res) => {
+                    let buf = '';
+                    res.on('data', chunk => { buf += chunk; });
+                    res.on('end', () => resolve({ status: res.statusCode || 0, body: buf }));
+                });
+                req.on('error', reject);
+                req.on('timeout', () => req.destroy(new Error('Refresh Token 请求超时')));
+                req.write(data);
+                req.end();
+            });
+            if (tokenResp.status !== 200) {
+                return { ok: false, error: `Refresh Token 换取 ID Token 失败: HTTP${tokenResp.status}` };
+            }
+            const tokenJson = JSON.parse(tokenResp.body);
+            const idToken = tokenJson.id_token || tokenJson.idToken;
+            if (!idToken) {
+                return { ok: false, error: 'Refresh Token 响应缺少 id_token' };
+            }
+            const rr = await require('./httpClient').post('https://register.windsurf.com/exa.api_server_pb.ApiServerService/RegisterUser', { firebase_id_token: idToken }, { Accept: 'application/json', 'connect-protocol-version': '1' });
+            if (rr.status !== 200) {
+                return { ok: false, error: `RegisterUser失败:HTTP${rr.status}` };
+            }
+            const rd = JSON.parse(rr.body);
+            const apiKey = rd.api_key || rd.apiKey;
+            if (!apiKey) {
+                return { ok: false, error: 'RegisterUser响应缺少api_key' };
+            }
+            return {
+                ok: true,
+                value: {
+                    email,
+                    apiKey,
+                    apiServerUrl: rd.api_server_url || rd.apiServerUrl || 'https://server.codeium.com',
+                    name: rd.name || email.split('@')[0],
+                },
+            };
+        }
+        catch (err) {
+            return { ok: false, error: 'Refresh Token 导入出错:' + (err?.message || String(err)) };
+        }
+    }
+    /**
+     * 生成 webview HTML
+     */
+    _getHtmlForWebview(webview) {
+        const extVersion = vscode.extensions.getExtension('local.windsurf-pool')?.packageJSON?.version || '0.0.0';
+        const cssUri = `${webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'resources', 'webview', 'main.css'))}?v=${extVersion}`;
+        const jsUri = `${webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'resources', 'webview', 'main.js'))}?v=${extVersion}`;
+        return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="${cssUri}">
+</head>
+<body>
+  <div class="app">
+
+    <!-- Windsurf 增强面板（顶部，默认折叠） -->
+    <div class="card enhance-card" id="enhanceArea">
+      <details class="enhance-details" id="enhanceDetails">
+        <summary class="enhance-summary">
+          <svg class="enhance-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+          <span class="enhance-title">Windsurf 增强</span>
+          <span class="enhance-arrow"></span>
+          <button class="enhance-toggle-btn" id="enhanceToggleBtn">未启用</button>
+        </summary>
+        <div class="enhance-body">
+          <!-- 状态信息 -->
+          <div style="display:flex;flex-direction:column;gap:4px">
+            <div class="v2-status-row">
+              <span class="v2-status-label">增强脚本</span>
+              <span class="v2-status-val" id="enhanceScriptStatus">检测中…</span>
+            </div>
+            <div class="v2-status-row">
+              <span class="v2-status-label">智能建议规则</span>
+              <span class="v2-status-val" id="enhanceBubbleRules">检测中…</span>
+            </div>
+            <div class="v2-status-row">
+              <span class="v2-status-label">无感切号</span>
+              <span class="v2-status-val" id="enhanceSignalBridge">检测中…</span>
+            </div>
+          </div>
+
+          <!-- 操作按钮 -->
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <button class="v2-btn b-blue" id="enhanceReinjectBtn" title="重新注入增强脚本到 workbench.html">重新注入</button>
+            <button class="v2-btn b-ghost" id="enhanceInjectRulesBtn" title="修改系统提示词（~/.windsurfrules）">修改提示词</button>
+            <button class="v2-btn b-danger-outline" id="enhanceRestoreBtn" title="恢复原始 workbench.html">恢复原始</button>
+            <button class="v2-btn b-ghost" id="enhResetMachineIdBtn" title="重置 Windsurf 机器码（machineId / sqmId / devDeviceId），需完全关闭后重启" style="color:#f59e0b">重置机器码</button>
+          </div>
+
+          <div class="v2-divider"></div>
+
+          <!-- 回复建议提示设置 -->
+          <div>
+            <div class="v2-section-title">回复建议提示</div>
+            <div class="v2-note" style="margin:4px 0 10px;padding:8px 12px;background:var(--vscode-textBlockQuote-background,rgba(127,127,127,.1));border-radius:6px;font-size:12px;line-height:1.6;color:var(--vscode-descriptionForeground,#888)">
+              <b>⚠️ 使用前提：</b>需要在 Windsurf 的 <b>Global Rules</b>（全局提示词）中添加气泡规则，AI 才会在回复末尾输出 <code>:::bubbles</code> 标记。<br>
+              点击上方「修改提示词」即可一键注入规则到全局提示词文件（<code>~/.windsurfrules</code>）。
+            </div>
+            <div class="v2-strip">
+              <div class="v2-strip-band c-emerald"></div>
+              <div class="v2-strip-info">
+                <span class="v2-strip-name">启用回复建议</span>
+                <span class="v2-strip-desc">AI 回复后显示建议操作气泡</span>
+              </div>
+              <div class="v2-mini-toggle is-on" id="enhBubblesEnabledToggle" data-target="enhBubblesEnabled"></div>
+              <input type="checkbox" id="enhBubblesEnabled" checked hidden>
+            </div>
+            <div class="v2-strip">
+              <div class="v2-strip-band c-cyan"></div>
+              <div class="v2-strip-info">
+                <span class="v2-strip-name">点击后自动发送</span>
+                <span class="v2-strip-desc">选择建议后直接发送，无需手动确认</span>
+              </div>
+              <div class="v2-mini-toggle is-on" id="enhBubblesAutoSendToggle" data-target="enhBubblesAutoSend"></div>
+              <input type="checkbox" id="enhBubblesAutoSend" checked hidden>
+            </div>
+
+            <div class="v2-opt-row" style="margin-top:8px">
+              <span class="v2-opt-label">主题</span>
+              <select class="v2-sel" id="enhBubblesTheme" style="flex:1">
+                <option value="emerald">绿青蓝（翡翠）</option>
+                <option value="aurora">紫粉（极光）</option>
+                <option value="sunset">橙红（日落）</option>
+                <option value="ocean">深蓝（海洋）</option>
+                <option value="glass">透明（毛玻璃）</option>
+                <option value="dark">暗夜</option>
+              </select>
+            </div>
+            <div class="v2-opt-row">
+              <span class="v2-opt-label">形状</span>
+              <select class="v2-sel" id="enhBubblesShape" style="flex:1">
+                <option value="pill">胶囊</option>
+                <option value="rounded" selected>圆角</option>
+                <option value="soft">柔和</option>
+                <option value="sharp">直角</option>
+              </select>
+            </div>
+            <!-- 气泡预览 -->
+            <div class="bubble-preview">
+              <div class="bubble-preview-label">预览效果</div>
+              <div class="bubble-preview-container" id="bubblePreviewContainer">
+                <div class="bubble-preview-item" id="bubblePreview1">添加单元测试</div>
+                <div class="bubble-preview-item" id="bubblePreview2">优化错误处理</div>
+                <div class="bubble-preview-item" id="bubblePreview3">重构为组件化</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="v2-divider"></div>
+
+          <!-- 界面汉化 -->
+          <div class="v2-strip">
+            <div class="v2-strip-band c-blue"></div>
+            <div class="v2-strip-info">
+              <span class="v2-strip-name">启用界面汉化</span>
+              <span class="v2-strip-desc">将 Windsurf 英文界面翻译为中文</span>
+            </div>
+            <div class="v2-mini-toggle is-on" id="enhLocalizationEnabledToggle" data-target="enhLocalizationEnabled"></div>
+            <input type="checkbox" id="enhLocalizationEnabled" checked hidden>
+          </div>
+
+          <div class="v2-divider"></div>
+
+          <!-- 底部状态栏 -->
+          <div>
+            <div class="v2-section-title">底部状态栏</div>
+            <div class="v2-strip">
+              <div class="v2-strip-band c-green"></div>
+              <div class="v2-strip-info">
+                <span class="v2-strip-name">启用状态栏显示</span>
+                <span class="v2-strip-desc">VS Code 底部显示当前账号、额度、号池、自动切号状态</span>
+              </div>
+              <div class="v2-mini-toggle is-on" id="enhStatusBarEnabledToggle" data-target="enhStatusBarEnabled"></div>
+              <input type="checkbox" id="enhStatusBarEnabled" checked hidden>
+            </div>
+            <div class="v2-opt-row" style="margin-top:6px">
+              <span class="v2-opt-label">位置</span>
+              <select class="v2-sel" id="enhStatusBarPosition" style="flex:1" title="状态栏显示位置">
+                <option value="left">← 左侧</option>
+                <option value="right" selected>→ 右侧（默认）</option>
+              </select>
+            </div>
+            <div class="v2-opt-row" style="margin-top:6px">
+              <span class="v2-opt-label">样式</span>
+              <select class="v2-sel" id="enhStatusBarStyle" style="flex:1" title="状态栏左段显示格式">
+                <option value="dot">🟢 — 仅圆点</option>
+                <option value="percent">75% — 仅百分比</option>
+                <option value="compact">🟢 75% — 圆点 + 百分比</option>
+                <option value="dual">🟢 75% / 87% — 日 / 周</option>
+                <option value="labeled" selected>日剩余 🟡 75% 周剩余 87% — 标签式（默认）</option>
+                <option value="full">sox · 🟢 日剩余75% 周剩余87% — 完整</option>
+              </select>
+            </div>
+            <div class="v2-opt-row" style="margin-top:6px;flex-wrap:wrap;gap:4px">
+              <span class="v2-opt-label">右段</span>
+              <div style="flex:1"></div>
+              <span class="v2-tag is-on" id="enhSbPoolTag" data-target="enhSbShowPool" title="显示号池可用账号数">池计数</span>
+              <span class="v2-tag is-on" id="enhSbAutoTag" data-target="enhSbShowAutoSwitch" title="显示自动切号开关状态 / 冷却倒计时">自动状态</span>
+              <span class="v2-tag is-on" id="enhSbInstTag" data-target="enhSbShowInstance" title="多实例开多个 Windsurf 时区分当前实例">实例名</span>
+              <input type="checkbox" id="enhSbShowPool" checked hidden>
+              <input type="checkbox" id="enhSbShowAutoSwitch" checked hidden>
+              <input type="checkbox" id="enhSbShowInstance" checked hidden>
+            </div>
+            <!-- 额度刷新频率 -->
+            <div style="margin-top:8px">
+              <div class="v2-param-grid">
+                <div class="v2-param-cell">
+                  <span class="v2-param-label">当前账号</span>
+                  <div><input type="number" class="v2-param-val" id="enhRefreshCurrent" value="5" min="3" max="60"><span class="v2-param-unit">秒</span></div>
+                </div>
+                <div class="v2-param-cell">
+                  <span class="v2-param-label">全部账号</span>
+                  <div><input type="number" class="v2-param-val" id="enhRefreshAll" value="3" min="1" max="30"><span class="v2-param-unit">分钟</span></div>
+                </div>
+              </div>
+              <div class="v2-hint" style="margin-top:4px">当前账号：状态栏额度数字的刷新频率。全部账号：号池候选额度的刷新频率。</div>
+              <details class="as-adv-details" style="margin-top:8px">
+                <summary class="as-adv-summary">大号池刷新性能</summary>
+                <div class="as-adv-body">
+                  <div class="v2-param-grid cols-3">
+                    <div class="v2-param-cell">
+                      <span class="v2-param-label">刷新并发</span>
+                      <div><input type="number" class="v2-param-val" id="enhRefreshConcurrency" value="12" min="1" max="50"><span class="v2-param-unit">线程</span></div>
+                    </div>
+                    <div class="v2-param-cell">
+                      <span class="v2-param-label">批次间隔</span>
+                      <div><input type="number" class="v2-param-val" id="enhRefreshBatchDelay" value="250" min="0" max="10000"><span class="v2-param-unit">ms</span></div>
+                    </div>
+                    <div class="v2-param-cell">
+                      <span class="v2-param-label">会员补查</span>
+                      <div><input type="number" class="v2-param-val" id="enhPeriodRefreshHours" value="6" min="0" max="168"><span class="v2-param-unit">小时</span></div>
+                    </div>
+                  </div>
+                  <div class="v2-hint" style="margin-top:4px">300 个号建议：并发 12-20，间隔 200-500ms。会员补查设 0 表示每次都查期限，速度会明显变慢。</div>
+                </div>
+              </details>
+            </div>
+          </div>
+
+          <div class="v2-divider"></div>
+
+          <!-- 完成提醒 -->
+          <div>
+            <div class="v2-section-title">完成提醒</div>
+            <div class="v2-strip">
+              <div class="v2-strip-band c-amber"></div>
+              <div class="v2-strip-info">
+                <span class="v2-strip-name">启用完成提醒</span>
+                <span class="v2-strip-desc">AI 回复完成时播放提示音 / 弹通知</span>
+              </div>
+              <div class="v2-mini-toggle is-on" id="enhNotifyEnabledToggle" data-target="enhNotifyEnabled"></div>
+              <input type="checkbox" id="enhNotifyEnabled" checked hidden>
+            </div>
+            <div class="v2-opt-row" style="margin-top:6px">
+              <span class="v2-opt-label">触发</span>
+              <select class="v2-sel" id="enhNotifyTrigger" style="flex:1">
+                <option value="always">每次都响</option>
+                <option value="error">仅异常时</option>
+                <option value="idle">仅窗口不活跃时</option>
+              </select>
+            </div>
+            <div class="v2-opt-row">
+              <span class="v2-opt-label">铃声</span>
+              <select class="v2-sel" id="enhNotifyTone" style="flex:1">
+                <option value="funk">Funk</option>
+                <option value="ding">Ding</option>
+                <option value="chime">Chime</option>
+                <option value="beep">Beep</option>
+                <option value="custom">自定义音符</option>
+                <option value="file">音频文件</option>
+              </select>
+              <button class="v2-btn b-ghost" id="enhNotifyTest" title="试听" style="padding:4px 10px;font-size:10px">试听</button>
+            </div>
+            <div class="v2-opt-row" id="enhCustomToneRow" style="display:none">
+              <span class="v2-opt-label">自定义音符</span>
+              <input type="text" class="v2-sel" id="enhCustomTone" style="flex:1" placeholder="频率:时长, ... 如 880:200,0:50,660:200" title="格式: 频率Hz:时长ms，逗号分隔。0表示静音">
+            </div>
+            <div class="v2-opt-row" id="enhAudioFileRow" style="display:none">
+              <span class="v2-opt-label">文件路径</span>
+              <input type="text" class="v2-sel" id="enhAudioFile" style="flex:1" placeholder="音频文件路径（.wav / .mp3）" title="支持 .wav / .mp3 文件">
+              <button class="v2-btn b-ghost" id="enhAudioFileBrowse" title="浏览" style="padding:4px 10px;font-size:10px">📂</button>
+            </div>
+            <div class="v2-opt-row">
+              <span class="v2-opt-label">次数</span>
+              <span class="v2-inline-params"><input type="number" id="enhNotifyRepeat" value="1" min="1" max="5"></span>
+              <span class="v2-opt-label">次</span>
+              <div style="flex:1"></div>
+              <span class="v2-tag is-on" id="enhNotifySoundTag" data-target="enhNotifySound">响铃</span>
+              <span class="v2-tag is-on" id="enhNotifyDesktopTag" data-target="enhNotifyDesktop">通知</span>
+              <input type="checkbox" id="enhNotifySound" checked hidden>
+              <input type="checkbox" id="enhNotifyDesktop" checked hidden>
+            </div>
+          </div>
+
+        </div>
+      </details>
+    </div>
+
+    <!-- 自动切号面板 -->
+    <div class="card auto-switch-card" id="autoSwitchArea">
+      <details class="as-details" id="asDetails">
+        <summary class="as-top-summary">
+          <svg class="as-top-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+          <span class="as-top-title">自动切号</span>
+          <span class="as-top-arrow"></span>
+          <label class="as-switch" onclick="event.stopPropagation()">
+            <input type="checkbox" id="asEnabled" checked>
+            <span class="as-switch-track"><span class="as-switch-thumb"></span></span>
+          </label>
+        </summary>
+        <div class="as-body" id="asBody" style="flex-direction:column;gap:12px;padding-top:14px">
+
+          <!-- ★ 核心设置：一句话说清楚 -->
+          <div class="as-main-setting">
+            <span>额度低于</span>
+            <input type="number" class="as-inline-num" id="asThreshold" value="15" min="1" max="99">
+            <span class="v2-param-unit">%</span>
+            <span>时自动换号</span>
+          </div>
+
+          <!-- 范围（多标签用户常用） -->
+          <div class="v2-opt-row">
+            <span class="v2-opt-label">范围</span>
+            <select class="v2-sel" id="asPoolScope" style="flex:1">
+              <option value="all">全部账号</option>
+              <option value="tag">按标签</option>
+              <option value="instance">当前实例分组</option>
+            </select>
+          </div>
+          <!-- 标签多选区（按标签时显示） -->
+          <div id="asTagPicker" style="display:none">
+            <div class="as-tag-options" id="asTagOptions">
+              <!-- JS 动态填充可选标签 -->
+            </div>
+            <div class="as-tag-selected" id="asTagSelected">
+              <!-- JS 动态填充已选标签 chips -->
+            </div>
+          </div>
+
+          <div class="v2-hint" id="asHint">取日/周配额中较低者为准。例：日100% 周0% → 实际不可用，自动切到额度最充足的号。</div>
+
+          <!-- ★ 高级设置（默认折叠） -->
+          <details class="as-adv-details" id="asAdvancedDetails">
+            <summary class="as-adv-summary">高级设置</summary>
+            <div class="as-adv-body">
+
+              <!-- 运行参数 -->
+              <div class="v2-param-grid">
+                <div class="v2-param-cell">
+                  <span class="v2-param-label">切号冷却</span>
+                  <div><input type="number" class="v2-param-val" id="asCooldown" value="15" min="5" max="300"><span class="v2-param-unit">秒</span></div>
+                </div>
+              </div>
+              <!-- 切号策略 -->
+              <div class="v2-opt-row">
+                <span class="v2-opt-label">策略</span>
+                <select class="v2-sel" id="asSwitchStrategy" style="flex:1">
+                  <option value="highestFirst">满额度优先（推荐）</option>
+                  <option value="lowestNonZero">先用完再换新</option>
+                </select>
+              </div>
+              <div class="v2-hint" id="asStrategyHint">优先选额度最充足的号切入，保证可用时间最长</div>
+
+              <div class="v2-divider"></div>
+
+              <!-- 门槛参数 -->
+              <div class="v2-param-grid">
+                <div class="v2-param-cell">
+                  <span class="v2-param-label">废号下限</span>
+                  <div><input type="number" class="v2-param-val" id="asMinQuota" value="10" min="0" max="50"><span class="v2-param-unit">%</span></div>
+                </div>
+                <div class="v2-param-cell" id="asPreferUsedCell">
+                  <span class="v2-param-label">已用阈值</span>
+                  <div><input type="number" class="v2-param-val" id="asPreferUsedThreshold" value="50" min="10" max="90"><span class="v2-param-unit">%</span></div>
+                </div>
+              </div>
+              <div class="v2-hint" style="margin-top:4px" id="asThresholdHint">废号下限：日/周任一配额低于此值的号不会被选中。</div>
+
+            </div>
+          </details>
+
+          <div style="margin-top:10px;padding:8px 10px;background:var(--vscode-textBlockQuote-background,rgba(127,127,127,.08));border-radius:6px;font-size:11px;color:var(--vscode-descriptionForeground,#888);display:flex;align-items:center;justify-content:space-between;gap:8px">
+            <span>切号记录已移至统计面板</span>
+            <button class="as-open-panel-btn" onclick="vscode.postMessage({type:'openLogPanel',tab:'switch'})" style="padding:2px 10px;font-size:11px;border-radius:4px;border:1px solid var(--border-subtle);background:transparent;color:inherit;cursor:pointer">查看日志 →</button>
+          </div>
+
+        </div>
+      </details>
+    </div>
+
+
+    <!-- 自动继续面板 -->
+    <div class="card auto-switch-card ac-root" id="autoContinueArea">
+      <details class="as-details" id="acDetails">
+        <summary class="as-top-summary">
+          <svg class="as-top-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect x="4" y="8" width="16" height="12" rx="2"/><circle cx="9" cy="13" r="1"/><circle cx="15" cy="13" r="1"/><path d="M12 17h.01"/></svg>
+          <span class="as-top-title">自动继续</span>
+          <span class="as-top-arrow"></span>
+          <label class="as-switch" onclick="event.stopPropagation()">
+            <input type="checkbox" id="enhAutoContinueEnabled" checked>
+            <span class="as-switch-track"><span class="as-switch-thumb"></span></span>
+          </label>
+        </summary>
+        <div class="ac-body" id="acBody">
+          <!-- 关闭状态 -->
+          <div id="acOffHint" class="ac-off-state" style="display:none">
+            <div class="ac-glass-card">
+              <div class="ac-off-content">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" class="ac-dim-icon"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>
+                <div class="ac-off-title">功能已禁用</div>
+                <p class="ac-off-desc">开启总开关以激活自动化任务处理</p>
+              </div>
+            </div>
+          </div>
+
+          <!-- 开启状态 -->
+          <div id="acOnContent" style="display:flex;flex-direction:column;gap:12px">
+            <!-- 本次会话统计 -->
+            <div class="ac-stats-bar" id="acStatsBar" style="display:none">
+              <div class="ac-stats-header">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="12" width="4" height="9" rx="1"/><rect x="10" y="8" width="4" height="13" rx="1"/><rect x="17" y="4" width="4" height="17" rx="1"/></svg>
+                <span>本次统计</span>
+                <span class="ac-stats-total" id="acStatsTotal">0</span>
+              </div>
+              <div class="ac-stats-items" id="acStatsItems">
+                <span class="ac-stats-chip" data-key="continueBtn" title="自动点击「继续回复」按钮"><span class="ac-stats-dot c-emerald"></span>续写 <b id="acStatContinueBtn">0</b></span>
+                <span class="ac-stats-chip" data-key="sendMsg" title="发送 continue 消息"><span class="ac-stats-dot c-blue"></span>发送 <b id="acStatSendMsg">0</b></span>
+                <span class="ac-stats-chip" data-key="retry" title="自动重试"><span class="ac-stats-dot c-amber"></span>重试 <b id="acStatRetry">0</b></span>
+                <span class="ac-stats-chip" data-key="switchAcct" title="自动切换账号"><span class="ac-stats-dot c-red"></span>切号 <b id="acStatSwitchAcct">0</b></span>
+                <span class="ac-stats-chip" data-key="switchModel" title="自动切换模型"><span class="ac-stats-dot c-violet"></span>切模型 <b id="acStatSwitchModel">0</b></span>
+                <span class="ac-stats-chip" data-key="permission" title="自动批准权限请求"><span class="ac-stats-dot c-cyan"></span>权限 <b id="acStatPermission">0</b></span>
+                <span class="ac-stats-chip" data-key="dismiss" title="自动关闭干扰弹窗"><span class="ac-stats-dot c-gray"></span>清除 <b id="acStatDismiss">0</b></span>
+              </div>
+            </div>
+            <!-- Segment Tab -->
+            <div class="v2-segment">
+              <input type="radio" name="acTab" id="acTabGuardian" value="guardian" checked>
+              <label for="acTabGuardian" class="v2-segment-label">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                守护模式
+              </label>
+              <input type="radio" name="acTab" id="acTabLongTask" value="long-task">
+              <label for="acTabLongTask" class="v2-segment-label">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+                长任务
+              </label>
+              <div class="v2-segment-slider" id="acSegmentSlider"></div>
+            </div>
+
+            <!-- 守护模式 -->
+            <div class="ac-section-panel" id="acPanelGuardian">
+              <div class="v2-strip">
+                <div class="v2-strip-band c-emerald"></div>
+                <div class="v2-strip-info"><span class="v2-strip-name">自动续写</span><span class="v2-strip-desc">自动点击「继续回复」按钮</span></div>
+                <div class="v2-mini-toggle is-on" id="enhGdAutoContinueBtnToggle" data-target="enhGdAutoContinueBtn"></div>
+                <input type="checkbox" id="enhGdAutoContinueBtn" checked hidden>
+              </div>
+              <div class="v2-strip">
+                <div class="v2-strip-band c-blue"></div>
+                <div class="v2-strip-info"><span class="v2-strip-name">自动重试</span><span class="v2-strip-desc">网络超时或生成失败时自动重试</span></div>
+                <div class="v2-mini-toggle is-on" id="enhGdAutoRetryToggle" data-target="enhGdAutoRetry"></div>
+                <input type="checkbox" id="enhGdAutoRetry" checked hidden>
+              </div>
+              <div class="v2-strip">
+                <div class="v2-strip-band c-violet"></div>
+                <div class="v2-strip-info"><span class="v2-strip-name">突破限制</span><span class="v2-strip-desc">工具调用上限时自动发送 continue</span></div>
+                <div class="v2-mini-toggle is-on" id="enhGdAutoSendOnToolLimitToggle" data-target="enhGdAutoSendOnToolLimit"></div>
+                <input type="checkbox" id="enhGdAutoSendOnToolLimit" checked hidden>
+              </div>
+              <div class="v2-strip">
+                <div class="v2-strip-band c-amber"></div>
+                <div class="v2-strip-info"><span class="v2-strip-name">清除干扰</span><span class="v2-strip-desc">自动关闭「文件损坏」等系统弹窗</span></div>
+                <div class="v2-mini-toggle is-on" id="enhGdDismissCorruptToggle" data-target="enhGdDismissCorrupt"></div>
+                <input type="checkbox" id="enhGdDismissCorrupt" checked hidden>
+              </div>
+
+              <div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--card-border)">
+                <div class="v2-section-title">自动批准权限</div>
+                <div style="display:flex;gap:4px;flex-wrap:wrap">
+                  <span class="v2-tag is-on" id="enhGdApproveWebTag" data-target="enhGdApproveWeb">Web 访问</span>
+                  <span class="v2-tag is-on" id="enhGdApproveTerminalTag" data-target="enhGdApproveTerminal">终端执行</span>
+                  <span class="v2-tag is-on" id="enhGdApproveFileTag" data-target="enhGdApproveFile">文件写入</span>
+                  <input type="checkbox" id="enhGdApproveWeb" checked hidden>
+                  <input type="checkbox" id="enhGdApproveTerminal" checked hidden>
+                  <input type="checkbox" id="enhGdApproveFile" checked hidden>
+                </div>
+              </div>
+            </div>
+
+            <!-- 长任务模式 -->
+            <div class="ac-section-panel" id="acPanelLongTask" style="display:none">
+              <!-- 状态条 -->
+              <div class="v2-lt-status" id="acStatusStrip">
+                <div class="v2-lt-dot" id="acStatusDot"></div>
+                <span class="v2-lt-text" id="acStatusText">系统就绪</span>
+                <span class="v2-lt-count" id="acStatusCount" style="display:none"><span id="acContinueCount">0</span> 轮</span>
+              </div>
+
+              <!-- 指令队列 -->
+              <div style="margin-top:12px">
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+                  <span class="v2-section-title" style="margin:0">指令队列</span>
+                  <span style="font-family:var(--vscode-editor-font-family,monospace);font-size:11px;color:var(--muted)">循环</span>
+                </div>
+                <div class="v2-queue-list" id="acQueueList">
+                  <div class="v2-queue-item is-active" data-idx="0">
+                    <span class="v2-queue-idx">1</span>
+                    <input class="v2-queue-text" value="继续" placeholder="输入指令...">
+                    <button class="ac-btn-icon ac-btn-del" title="删除" style="font-size:10px;opacity:0.5;cursor:pointer;background:none;border:none;color:inherit">✕</button>
+                  </div>
+                </div>
+                <div style="display:flex;gap:4px;margin-top:6px">
+                  <input class="v2-queue-text" id="acQueueNewText" placeholder="添加新指令..." style="flex:1;background:color-mix(in srgb, var(--vscode-editor-background) 50%, transparent);border:1px solid var(--card-border);border-radius:4px;padding:5px 8px">
+                  <button class="v2-btn b-emerald" id="acQueueAddBtn" style="padding:5px 10px;font-size:10px">+ 添加</button>
+                </div>
+              </div>
+
+              <!-- 运行参数 -->
+              <div class="v2-param-grid cols-3" style="margin-top:14px">
+                <div class="v2-param-cell"><span class="v2-param-label">等待</span><div><input type="number" class="v2-param-val" id="enhLtIdleSeconds" min="2" max="120" value="2"><span class="v2-param-unit">秒</span></div></div>
+                <div class="v2-param-cell"><span class="v2-param-label">上限</span><div><input type="number" class="v2-param-val" id="enhLtMaxContinue" min="0" max="9999" value="100"><span class="v2-param-unit">轮</span></div></div>
+                <div class="v2-param-cell"><span class="v2-param-label">重试</span><div><input type="number" class="v2-param-val" id="enhLtMaxSendRetries" min="1" max="20" value="10"><span class="v2-param-unit">次</span></div></div>
+              </div>
+
+              <!-- 选项标签 -->
+              <div style="display:flex;align-items:center;gap:8px;margin-top:10px">
+                <span class="v2-opt-label">选项</span>
+                <span class="v2-tag is-on" id="enhLtLoopTag" data-target="enhLtLoop">循环队列</span>
+                <span class="v2-tag is-on" id="enhLtStopOnInterventionTag" data-target="enhLtStopOnIntervention">错误时停止</span>
+                <input type="checkbox" id="enhLtLoop" checked hidden>
+                <input type="checkbox" id="enhLtStopOnIntervention" checked hidden>
+              </div>
+
+              <!-- 操作栏 -->
+              <div class="v2-ctrl-bar" style="margin-top:14px">
+                <button class="v2-btn b-emerald" id="acStartBtn">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M5 3l14 9-14 9V3z"/></svg>
+                  开始运行
+                </button>
+                <button class="v2-btn b-amber" id="acPauseBtn" style="display:none">⏸ 暂停</button>
+                <button class="v2-btn b-emerald" id="acResumeBtn" style="display:none">▶ 继续</button>
+                <button class="v2-btn b-red" id="acStopBtn" style="display:none">⏹ 停止</button>
+              </div>
+              <div style="display:flex;gap:6px;margin-top:8px">
+                <button class="v2-btn b-ghost" id="testSendContinueBtn" style="flex:1;font-size:10px">测试发送</button>
+                <button class="v2-btn b-danger-outline" id="acForceStopBtn" disabled style="flex:1;font-size:10px">强制中断</button>
+              </div>
+              <div class="test-result" id="testSendContinueResult"></div>
+              <div class="ac-last-action" id="acLastAction" style="display:none"></div>
+            </div>
+          </div>
+
+          <!-- 错误恢复核心引擎 -->
+          <div class="v2-divider" style="margin:8px 0"></div>
+          <details class="v2-engine">
+            <summary class="v2-engine-head">
+              <div class="v2-engine-icon">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>
+              </div>
+              <div class="v2-engine-meta">
+                <span class="v2-engine-name">错误恢复核心</span>
+                <span class="v2-engine-stat">● 监控中</span>
+              </div>
+              <span class="v2-engine-chevron"></span>
+            </summary>
+            <div class="v2-engine-rules" style="padding:10px 12px">
+              <div class="v2-strip" style="margin-bottom:8px;padding:8px 10px;background:color-mix(in srgb, var(--vscode-foreground) 3%, transparent);border-radius:4px">
+                <div class="v2-strip-band c-emerald"></div>
+                <div class="v2-strip-info" style="flex:1">
+                  <span class="v2-strip-name">自动故障排除引擎</span>
+                  <span class="v2-strip-desc">检测异常并按规则自动恢复</span>
+                </div>
+                <div class="v2-mini-toggle is-on" id="enhAutoRecoveryEnabledToggle" data-target="enhAutoRecoveryEnabled"></div>
+                <input type="checkbox" id="enhAutoRecoveryEnabled" checked hidden>
+              </div>
+
+              <!-- v6.6.0 恢复确认 Banner 设置 -->
+              <div class="v2-strip" style="margin-bottom:6px;padding:8px 10px;background:color-mix(in srgb, var(--vscode-foreground) 3%, transparent);border-radius:4px">
+                <div class="v2-strip-band c-blue"></div>
+                <div class="v2-strip-info" style="flex:1">
+                  <span class="v2-strip-name">恢复确认 Banner</span>
+                  <span class="v2-strip-desc">所有自动操作前弹倒计时，可切换策略或取消</span>
+                </div>
+                <div class="v2-mini-toggle is-on" id="enhRecoveryConfirmEnabledToggle" data-target="enhRecoveryConfirmEnabled"></div>
+                <input type="checkbox" id="enhRecoveryConfirmEnabled" checked hidden>
+              </div>
+              <div style="display:flex;align-items:center;gap:8px;padding:4px 10px 4px;font-size:11.5px;color:var(--vscode-foreground);opacity:0.85">
+                <span style="flex:1">倒计时秒数</span>
+                <input type="number" min="3" max="15" step="1" id="enhRecoveryCountdownSeconds" value="5" style="width:58px;padding:3px 6px;border-radius:3px;border:1px solid var(--vscode-input-border, transparent);background:var(--vscode-input-background);color:var(--vscode-input-foreground);font-size:11.5px">
+                <span style="opacity:0.6">秒（3-15）</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:8px;padding:4px 10px 10px;font-size:11.5px;color:var(--vscode-foreground);opacity:0.85">
+                <span style="flex:1">已学习的偏好</span>
+                <button type="button" id="enhRecoveryPrefsClear" style="padding:4px 10px;border-radius:3px;border:1px solid var(--vscode-button-border, transparent);background:var(--vscode-button-secondaryBackground, #3a3a3a);color:var(--vscode-button-secondaryForeground, #cbd5e1);font-size:11px;cursor:pointer">清除所有偏好</button>
+              </div>
+
+              <div style="display:flex;flex-direction:column;gap:2px">
+                <!-- 网络故障 -->
+                <details class="v2-rule-details">
+                  <summary class="v2-rule-row">
+                    <span class="v2-rule-dot net"></span>
+                    <span class="v2-rule-name">网络超时 / 通信异常</span>
+                  </summary>
+                  <div class="v2-rule-content">
+                    <div class="v2-field-row">
+                      <span>处理策略</span>
+                      <select class="v2-sel" id="ruleNetworkAction">
+                        <option value="retry">立即重试</option>
+                        <option value="switch-account">切换备用号</option>
+                        <option value="notify">仅发出警报</option>
+                        <option value="ignore">不处理</option>
+                      </select>
+                    </div>
+                    <div class="v2-field-row" id="ruleNetworkRetryOpts">
+                      <span>重试参数</span>
+                      <div class="v2-inline-params">
+                        <input type="number" id="ruleNetworkMaxRetries" value="3" min="1" max="10" style="width:40px;text-align:center">次 /
+                        <input type="number" id="ruleNetworkDelay" value="3" min="1" max="30" style="width:40px;text-align:center">秒
+                      </div>
+                    </div>
+                    <button class="v2-btn-sm" id="testRetryBtn">执行模拟测试</button>
+                    <div class="test-result" id="testRetryResult"></div>
+                  </div>
+                </details>
+
+                <!-- 配额/频率 -->
+                <details class="v2-rule-details">
+                  <summary class="v2-rule-row">
+                    <span class="v2-rule-dot quota"></span>
+                    <span class="v2-rule-name">额度耗尽 / 访问限流</span>
+                  </summary>
+                  <div class="v2-rule-content">
+                    <div class="v2-field-row">
+                      <span>自动切号</span>
+                      <div class="v2-mini-checks">
+                        <label><input type="checkbox" id="enhAutoSwitchOnQuota" checked><span>额度</span></label>
+                        <label><input type="checkbox" id="enhAutoSwitchOnRateLimit" checked><span>限流</span></label>
+                      </div>
+                    </div>
+                    <div class="v2-field-row">
+                      <span>恢复策略</span>
+                      <select class="v2-sel" id="ruleQuotaAction">
+                        <option value="switch-account">轮换至下一账号</option>
+                        <option value="switch-model">降级至备用模型</option>
+                        <option value="notify">仅发出警报</option>
+                        <option value="ignore">忽略</option>
+                      </select>
+                    </div>
+                    <div class="v2-field-row">
+                      <span>切号后动作</span>
+                      <select class="v2-sel" id="ruleQuotaAfterAction">
+                        <option value="auto">智能接续</option>
+                        <option value="send-continue">强制发继续</option>
+                        <option value="retry-message">重发上一条</option>
+                        <option value="none">等待指令</option>
+                      </select>
+                    </div>
+                    <button class="v2-btn-sm" id="testSwitchAccountBtn">模拟切号流程</button>
+                    <div class="test-result" id="testSwitchAccountResult"></div>
+                  </div>
+                </details>
+
+                <!-- 模型故障 -->
+                <details class="v2-rule-details">
+                  <summary class="v2-rule-row">
+                    <span class="v2-rule-dot model"></span>
+                    <span class="v2-rule-name">模型过载 / 暂不可用</span>
+                  </summary>
+                  <div class="v2-rule-content">
+                    <div class="v2-field-row">
+                      <span>恢复方案</span>
+                      <select class="v2-sel" id="ruleModelAction">
+                        <option value="switch-model">轮换可用模型</option>
+                        <option value="switch-account">换号并重试</option>
+                        <option value="retry">原样重试</option>
+                        <option value="notify">仅通知</option>
+                        <option value="ignore">忽略</option>
+                      </select>
+                    </div>
+                    <div class="v2-field-row">
+                      <span>切换后</span>
+                      <select class="v2-sel" id="ruleModelAfterAction">
+                        <option value="send-continue">发送继续</option>
+                        <option value="auto">智能判断</option>
+                        <option value="retry-message">重发消息</option>
+                        <option value="none">不操作</option>
+                      </select>
+                    </div>
+                    <!-- 当前模型卡片 -->
+                    <div class="ms-current ms-brand-claude" id="msCurrentCard" style="margin-top:8px">
+                      <div class="ms-current-icon" id="msCurrentIcon">⚡</div>
+                      <div class="ms-current-info">
+                        <div class="ms-current-label">当前模型</div>
+                        <div class="ms-current-name" id="currentModelName">-</div>
+                      </div>
+                      <div class="ms-current-pulse"></div>
+                    </div>
+
+                    <!-- 备选模型队列 -->
+                    <div class="ms-section-head">
+                      <span class="ms-section-title">备选队列</span>
+                      <span class="ms-section-badge" id="msPriorityCount">0</span>
+                    </div>
+                    <div id="modelPriorityList" class="ac-tag-list"></div>
+
+                    <!-- 操作按钮 -->
+                    <div class="ms-actions">
+                      <button class="ms-btn" id="fetchModelsBtn">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
+                        获取列表
+                      </button>
+                      <button class="ms-btn ms-btn-primary" id="testSwitchModelBtn">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m5 12 7-7 7 7"/><path d="M12 19V5"/></svg>
+                        立即切换
+                      </button>
+                    </div>
+                    <div class="ms-result" id="testSwitchModelResult"></div>
+
+                    <!-- 手动输入 -->
+                    <div class="ms-input-row">
+                      <input type="text" id="modelPriorityInput" placeholder="输入模型名...">
+                      <button id="modelPriorityAdd">添加</button>
+                    </div>
+
+                    <!-- 可用模型列表 -->
+                    <div id="availableModelsList" class="ms-available-list"></div>
+                  </div>
+                </details>
+
+                <!-- 其他规则 -->
+                <details class="v2-rule-details">
+                  <summary class="v2-rule-row">
+                    <span class="v2-rule-dot other"></span>
+                    <span class="v2-rule-name">截断 / 权限 / 自定义</span>
+                  </summary>
+                  <div class="v2-rule-content">
+                    <div class="v2-field-row">
+                      <span>截断处理</span>
+                      <select class="v2-sel" id="ruleContinuationAction">
+                        <option value="send-continue">发送接续指令</option>
+                        <option value="notify">仅通知</option>
+                        <option value="ignore">忽略</option>
+                      </select>
+                    </div>
+                    <div class="v2-field-row">
+                      <span>权限请求</span>
+                      <select class="v2-sel" id="rulePermissionAction">
+                        <option value="auto-allow">自动允许</option>
+                        <option value="notify">仅通知</option>
+                      </select>
+                    </div>
+                    <div id="permissionScopeOpts" style="margin:6px 0">
+                      <div class="v2-mini-checks">
+                        <label><input type="checkbox" id="permScopeWeb" checked><span>Web</span></label>
+                        <label><input type="checkbox" id="permScopeTerminal"><span>终端</span></label>
+                        <label><input type="checkbox" id="permScopeFile"><span>文件</span></label>
+                      </div>
+                    </div>
+                    <button class="v2-btn-sm" id="testPermissionBtn">测试权限检测</button>
+                    <div class="test-result" id="testPermissionResult"></div>
+                    <div class="v2-field-row" style="margin-top:8px">
+                      <span>用户介入</span>
+                      <select class="v2-sel" id="ruleUserAction">
+                        <option value="notify">仅通知</option>
+                        <option value="ignore">忽略</option>
+                      </select>
+                    </div>
+                    <div id="customRulesList" class="ac-custom-rules" style="margin-top:8px"></div>
+                    <button class="v2-btn-sm" id="customRuleAdd" style="width:100%;margin-top:4px">+ 增加正则匹配规则</button>
+                  </div>
+                </details>
+              </div>
+
+            </div>
+          </details>
+        </div>
+      </details>
+    </div>
+
+    <!-- 多实例管理面板 -->
+    <div class="card instance-card" id="instanceArea">
+      <details class="inst-details" id="instDetails">
+        <summary class="inst-summary">
+          <svg class="inst-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+          <span class="inst-title" title="同时开多个 Windsurf 窗口，每个窗口登不同账号，可以同时用同一个项目">多实例分身</span>
+          <span class="inst-arrow"></span>
+          <div style="flex:1"></div>
+          <button class="inst-import-btn" id="instImportBtn" title="从 Cockpit Tools 导入">Cockpit</button>
+          <button class="inst-add-btn" id="instAddBtn" title="新建实例">+</button>
+          <button class="inst-refresh-btn" id="instRefreshBtn" title="刷新">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+          </button>
+        </summary>
+        <div class="inst-body">
+          <div id="instList" class="inst-list"></div>
+          <div id="instEmpty" class="inst-empty" hidden>暂无实例，点击 + 新建</div>
+        </div>
+      </details>
+    </div>
+
+    <!-- 新建实例模态框 -->
+    <div id="instCreateOverlay" class="modal-overlay" hidden>
+      <div class="modal-box" style="width:min(400px,92vw)">
+        <div class="modal-header">
+          <h3>新建实例</h3>
+          <button class="modal-close" id="instCreateClose" title="关闭">×</button>
+        </div>
+        <div class="modal-body">
+          <label>实例名称</label>
+          <input type="text" id="instCreateName" placeholder="例如：工作号、测试号">
+          <label>绑定账号</label>
+          <div id="instCreateAccount" class="account-picker"></div>
+          <label>自动切号标签分组</label>
+          <select id="instCreateTag" class="as-select" style="width:100%">
+            <option value="">不限（全部账号）</option>
+          </select>
+          <div class="inst-create-hint">新实例将复制当前 Windsurf 环境，启动后自动登录所选账号</div>
+          <div id="instCreateError" class="inst-error" hidden></div>
+          <button class="primary inst-create-submit" id="instCreateSubmit">创建实例</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Cockpit Tools 导入模态框 -->
+    <div id="cockpitImportOverlay" class="modal-overlay" hidden>
+      <div class="modal-box" style="width:min(480px,94vw)">
+        <div class="modal-header">
+          <h3>从 Cockpit Tools 导入</h3>
+          <button class="modal-close" id="cockpitImportClose" title="关闭">×</button>
+        </div>
+        <div class="modal-body">
+          <div id="cockpitList" class="cockpit-list"></div>
+          <div id="cockpitEmpty" class="cockpit-empty" hidden>未找到 Cockpit Tools 实例</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Cockpit 导入填表模态框（第二步） -->
+    <div id="cockpitFormOverlay" class="modal-overlay" hidden>
+      <div class="modal-box" style="width:min(400px,92vw)">
+        <div class="modal-header">
+          <h3>导入 Cockpit 实例</h3>
+          <button class="modal-close" id="cockpitFormClose" title="关闭">×</button>
+        </div>
+        <div class="modal-body">
+          <label>实例名称</label>
+          <input type="text" id="cockpitFormName" placeholder="例如：工作号、测试号">
+          <label>绑定账号</label>
+          <div id="cockpitFormAccount" class="account-picker"></div>
+          <div class="inst-create-hint">导入后，启动该实例时会自动登录所选账号。原 Cockpit 数据目录保留不变。</div>
+          <div id="cockpitFormError" class="inst-error" hidden></div>
+          <button class="primary inst-create-submit" id="cockpitFormSubmit">确认导入</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 实例编辑模态框 -->
+    <div id="instEditOverlay" class="modal-overlay" hidden>
+      <div class="modal-box" style="width:min(400px,92vw)">
+        <div class="modal-header">
+          <h3>编辑实例</h3>
+          <button class="modal-close" id="instEditClose" title="关闭">×</button>
+        </div>
+        <div class="modal-body">
+          <label>实例名称</label>
+          <input type="text" id="instEditName">
+          <label>绑定账号</label>
+          <div id="instEditAccount" class="account-picker"></div>
+          <label>自动切号标签分组</label>
+          <select id="instEditTag" class="as-select" style="width:100%">
+            <option value="">不限（全部账号）</option>
+          </select>
+          <div id="instEditError" class="inst-error" hidden></div>
+          <button class="primary inst-create-submit" id="instEditSubmit">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 通用确认对话框 -->
+    <div id="confirmOverlay" class="modal-overlay" hidden>
+      <div class="modal-box" style="width:min(360px,90vw)">
+        <div class="modal-header">
+          <h3 id="confirmTitle">确认</h3>
+          <button class="modal-close" id="confirmClose" title="关闭">×</button>
+        </div>
+        <div class="modal-body">
+          <div id="confirmMsg" style="font-size:13px;line-height:1.6;margin-bottom:12px;white-space:pre-wrap"></div>
+          <div style="display:flex;gap:8px;justify-content:flex-end">
+            <button class="modal-cancel-btn" id="confirmCancel">取消</button>
+            <button class="primary" id="confirmOk">确定</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 我的账号（含汇总 + 账号列表） -->
+    <div class="card list-card">
+      <details class="list-details" id="listDetails" open>
+        <summary class="list-summary">
+          <svg class="list-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+          <h3>我的账号</h3>
+          <span class="list-arrow"></span>
+          <div style="flex:1"></div>
+          <span class="grid-count" id="gridCount">0 个</span>
+          <button class="add-account-btn" id="addAccountBtn">添加账号</button>
+        </summary>
+        <div class="list-body">
+      <!-- 汇总统计 -->
+      <div id="summaryCard">
+        <div class="summary-stats">
+          <div class="summary-stat" id="summaryDailyStat">
+            <div class="summary-stat-head">
+              <svg class="summary-stat-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+              <span class="summary-stat-label">本日</span>
+              <span class="summary-stat-pct" id="summaryDailyPct">0%</span>
+            </div>
+            <div class="summary-bar"><div class="summary-bar-fill" id="summaryDailyBar" style="width:0%"></div></div>
+            <div class="summary-stat-footer">
+              <span class="summary-stat-num" id="summaryDailyNum">0</span>
+              <span class="summary-stat-max" id="summaryDailyMax">/ 0</span>
+            </div>
+          </div>
+          <div class="summary-stat" id="summaryWeeklyStat">
+            <div class="summary-stat-head">
+              <svg class="summary-stat-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+              <span class="summary-stat-label">本周</span>
+              <span class="summary-stat-pct" id="summaryWeeklyPct">0%</span>
+            </div>
+            <div class="summary-bar"><div class="summary-bar-fill" id="summaryWeeklyBar" style="width:0%"></div></div>
+            <div class="summary-stat-footer">
+              <span class="summary-stat-num" id="summaryWeeklyNum">0</span>
+              <span class="summary-stat-max" id="summaryWeeklyMax">/ 0</span>
+            </div>
+          </div>
+        </div>
+        <div class="summary-status-grid" id="summaryStatusGrid">
+          <div class="summary-status-row"><span class="summary-status-label">活跃 / 禁用</span><span class="summary-status-val" id="summaryActiveDisabled">0 / 0</span></div>
+          <div class="summary-status-row"><span class="summary-status-label">满额度账号</span><span class="summary-status-val ok" id="summaryHighQuota">0 个（≥ 80%）</span></div>
+          <div class="summary-status-row"><span class="summary-status-label">低额度账号</span><span class="summary-status-val warn" id="summaryLowQuota">0 个（≤ 30%）</span></div>
+          <div class="summary-status-row"><span class="summary-status-label">最近刷新</span><span class="summary-status-val off" id="summaryLastRefresh">--</span></div>
+        </div>
+        <!-- 用量统计 -->
+        <details class="usage-stats-details" id="usageStatsDetails">
+          <summary class="usage-stats-summary">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+            <span>用量统计</span>
+            <span class="usage-stats-date" id="usageStatsDate"></span>
+            <button class="as-open-panel-btn" title="打开统计面板（Ctrl+Shift+Q）" onclick="event.stopPropagation(); vscode.postMessage({type:'openLogPanel'})" style="margin-left:auto;display:inline-flex;align-items:center;gap:3px;padding:2px 8px;font-size:11px;border-radius:4px;border:1px solid var(--border-subtle);background:transparent;color:var(--muted);cursor:pointer">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+              统计面板
+            </button>
+          </summary>
+          <div class="usage-stats-body">
+            <div class="usage-stats-grid">
+              <div class="usage-stat-cell">
+                <div class="usage-stat-num" id="statPoolSignals">0</div>
+                <div class="usage-stat-label">请求信号</div>
+              </div>
+              <div class="usage-stat-cell">
+                <div class="usage-stat-num" id="statSwitches">0</div>
+                <div class="usage-stat-label">切号次数</div>
+              </div>
+              <div class="usage-stat-cell">
+                <div class="usage-stat-num" id="statRefreshes">0</div>
+                <div class="usage-stat-label">配额检查</div>
+              </div>
+              <div class="usage-stat-cell">
+                <div class="usage-stat-num" id="statAvgDailyUsed">0%</div>
+                <div class="usage-stat-label">平均日用量</div>
+              </div>
+            </div>
+            <div class="usage-stats-bar-section">
+              <div class="usage-stats-bar-row">
+                <span class="usage-stats-bar-label">日总用量</span>
+                <div class="usage-stats-bar"><div class="usage-stats-bar-fill daily" id="statDailyBar" style="width:0%"></div></div>
+                <span class="usage-stats-bar-val" id="statDailyVal">0</span>
+              </div>
+              <div class="usage-stats-bar-row">
+                <span class="usage-stats-bar-label">周总用量</span>
+                <div class="usage-stats-bar"><div class="usage-stats-bar-fill weekly" id="statWeeklyBar" style="width:0%"></div></div>
+                <span class="usage-stats-bar-val" id="statWeeklyVal">0</span>
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <!-- 测活面板 -->
+        <details class="usage-stats-details health-panel-details" id="healthPanelDetails">
+          <summary class="usage-stats-summary health-panel-summary">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+            <span>测活面板</span>
+            <span class="health-check-bar-count" id="hcBarCount"></span>
+            <button class="as-open-panel-btn" id="hcBarOpenPanel" title="打开测活面板" onclick="event.stopPropagation(); vscode.postMessage({type:'runCommand', command:'windsurfPool.openHealthCheck'})" style="margin-left:auto;display:inline-flex;align-items:center;gap:3px;padding:2px 8px;font-size:11px;border-radius:4px;border:1px solid var(--border-subtle);background:transparent;color:var(--muted);cursor:pointer">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+              测活面板
+            </button>
+          </summary>
+        </details>
+      </div>
+
+      <div class="panel-divider"></div>
+
+      <!-- 外部账户提示条 -->
+      <div id="externalBanner" class="external-banner" hidden>
+        <span class="external-banner-text">
+          当前 Windsurf 登录的账户 <strong id="externalEmail"></strong> 不在号池中
+        </span>
+        <button class="external-banner-btn" id="externalAddBtn">加入号池</button>
+      </div>
+      <!-- 搜索栏 -->
+      <div class="search-bar" id="searchBar">
+        <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input type="text" class="search-input" id="searchInput" placeholder="搜索账号..." autocomplete="off">
+        <button class="search-clear" id="searchClear" hidden title="清除">×</button>
+      </div>
+      <!-- 工具栏：过滤 + 排序 + 刷新 -->
+      <div class="toolbar-bar" id="toolbarBar">
+        <div class="filter-wrap" id="filterWrap">
+          <button class="filter-trigger" id="filterTrigger" title="过滤">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+            <span id="filterLabel">ALL</span>
+            <span class="filter-count" id="filterCount"></span>
+          </button>
+          <div class="filter-dropdown" id="filterDropdown" hidden>
+            <div class="filter-section" id="filterPlanSection">
+              <div class="filter-section-title">套餐</div>
+              <div class="filter-options" id="filterPlanList"></div>
+            </div>
+            <div class="filter-section" id="filterTagSection">
+              <div class="filter-section-title">标签</div>
+              <div class="filter-options" id="filterTagList"></div>
+            </div>
+            <div class="filter-section" id="filterStatusSection">
+              <div class="filter-section-title">状态</div>
+              <div class="filter-options" id="filterStatusList"></div>
+            </div>
+            <div class="filter-section" id="filterHealthSection">
+              <div class="filter-section-title">测活</div>
+              <div class="filter-options" id="filterHealthList"></div>
+            </div>
+            <div class="filter-actions">
+              <button class="filter-clear-btn" id="filterClearBtn">清空筛选</button>
+            </div>
+          </div>
+        </div>
+        <select class="group-select" id="sortSelect" title="排序方式">
+          <option value="default">默认排序</option>
+          <option value="recommend">⭐ 推荐</option>
+          <option value="min">综合配额</option>
+          <option value="daily">日配额</option>
+          <option value="weekly">周配额</option>
+          <option value="planEnd">到期日</option>
+          <option value="email">邮箱 A-Z</option>
+          <option value="created">添加时间</option>
+        </select>
+        <button class="sort-direction-btn" id="sortDirectionBtn" title="切换排序方向">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="12" y1="5" x2="12" y2="19"/>
+            <polyline points="19 12 12 19 5 12"/>
+          </svg>
+        </button>
+        <button class="toolbar-icon-btn" id="refreshAllBtn" title="刷新全部配额">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+          </svg>
+        </button>
+        <button class="toolbar-icon-btn" id="exportAccountsBtn" title="导出账号设置（换电脑用）">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+        </button>
+        <button class="toolbar-icon-btn" id="privacyModeBtn" title="隐私模式：隐藏邮箱">
+          <svg class="privacy-eye" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/>
+            <circle cx="12" cy="12" r="3"/>
+          </svg>
+          <svg class="privacy-eye-off" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" hidden>
+            <path d="M17.94 17.94A10.94 10.94 0 0 1 12 19C5 19 1 12 1 12a20.29 20.29 0 0 1 5.06-5.94"/>
+            <path d="M9.9 4.24A10.84 10.84 0 0 1 12 4c7 0 11 8 11 8a20.88 20.88 0 0 1-2.16 3.19"/>
+            <path d="M14.12 14.12A3 3 0 0 1 9.88 9.88"/>
+            <line x1="1" y1="1" x2="23" y2="23"/>
+          </svg>
+        </button>
+        <button class="quick-health-filter-btn" id="quickHealthOkBtn" title="只显示测活结果为可用的账号">可用</button>
+        <div style="flex:1"></div>
+        <select class="page-size-select" id="pageSizeSelect" title="每页显示">
+          <option value="10">10/页</option>
+          <option value="20" selected>20/页</option>
+          <option value="50">50/页</option>
+          <option value="0">全部</option>
+        </select>
+        <button class="group-select-mode-btn" id="selectModeBtn" title="多选模式">多选</button>
+      </div>
+      <!-- 标签管理栏 -->
+      <div class="tag-bar" id="tagBar">
+        <span class="tag-bar-label">标签:</span>
+        <div class="tag-list" id="tagList">
+          <!-- 动态生成的标签 -->
+        </div>
+      </div>
+      <!-- 批量操作栏（多选模式下显示） -->
+      <div class="batch-bar" id="batchBar" hidden>
+        <label class="batch-check-all"><input type="checkbox" id="batchCheckAll"><span>全选</span></label>
+        <div style="flex:1"></div>
+        <span class="batch-count" id="batchCount">已选 0</span>
+        <button class="batch-action-btn" id="batchTagBtn" title="为选中账号设置标签">加标签</button>
+        <button class="batch-action-btn" id="batchEnableBtn" title="启用选中账号">启用</button>
+        <button class="batch-action-btn" id="batchDisableBtn" title="禁用选中账号">禁用</button>
+        <button class="batch-action-btn batch-action-delete" id="batchDeleteBtn" title="删除选中账号">删除</button>
+        <button class="batch-action-btn" id="batchCancelBtn">取消</button>
+      </div>
+        <div id="accountGrid" class="account-grid"></div>
+        <div id="emptyState" class="empty-card">
+          <div class="empty-title">还没有账号</div>
+          <div class="empty-sub">点击上方 + 按钮添加账号</div>
+        </div>
+      </div>
+    </details>
+    </div>
+
+  </div>
+
+  <!-- 添加账号模态框 -->
+  <div id="addAccountOverlay" class="modal-overlay" hidden>
+    <div class="modal-box" style="width:min(480px,94vw);max-height:88vh">
+      <div class="modal-header">
+        <h3>添加账号</h3>
+        <button class="modal-close" id="addAccountClose" title="关闭">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="add-tabs">
+          <button class="add-tab" data-tab="oauth">OAuth 授权</button>
+          <button class="add-tab active" data-tab="batch">批量导入</button>
+          <button class="add-tab" data-tab="single">单个登录</button>
+          <button class="add-tab" data-tab="current">已登录账户</button>
+        </div>
+
+        <!-- OAuth 授权 -->
+        <div id="oauthLoginArea" hidden>
+          <p class="footnote">打开 Windsurf 官方授权页，完成后自动保存到号池。</p>
+          <label>标签（可选）</label>
+          <input type="text" id="oauthTag" placeholder="如：OAuth、主力号">
+          <button class="primary" data-action="oauthLogin" style="margin-top:10px">开始 OAuth 授权</button>
+          <div id="oauthMsg" class="batch-msg" hidden></div>
+        </div>
+
+        <!-- 单个登录 -->
+        <div id="singleLoginArea" hidden>
+          <label>邮箱</label>
+          <input type="email" id="email" placeholder="your@email.com">
+          <label>密码</label>
+          <input type="password" id="loginPassword" placeholder="密码">
+          <label>标签（可选）</label>
+          <input type="text" id="loginTag" placeholder="如：工作号、测试号">
+          <button class="primary" data-action="loginSave" style="margin-top:10px">登录并保存</button>
+        </div>
+
+        <!-- 批量导入 -->
+        <div id="batchImportArea">
+          <div class="batch-section">
+            <label class="batch-mode-label">导入标签</label>
+            <input type="text" id="batchTag" class="batch-tag-input" placeholder="为本批导入的账号设置标签（可选）">
+          </div>
+          <div class="batch-section">
+            <label class="batch-mode-label">导入格式/方式</label>
+            <div class="batch-radio-group">
+              <label class="batch-radio"><input type="radio" name="batchFormat" value="text" checked> 文本</label>
+              <label class="batch-radio"><input type="radio" name="batchFormat" value="json"> JSON</label>
+              <label class="batch-radio"><input type="radio" name="batchFormat" value="devin"> Devin Token</label>
+              <label class="batch-radio"><input type="radio" name="batchFormat" value="server"> 服务器导入</label>
+            </div>
+          </div>
+
+          <div class="batch-section" id="batchAuthSection">
+            <label class="batch-mode-label">登录方式</label>
+            <div class="batch-radio-group">
+              <label class="batch-radio"><input type="radio" name="batchAuthMethod" value="auto" checked> 自动</label>
+              <label class="batch-radio"><input type="radio" name="batchAuthMethod" value="auth1"> Auth1</label>
+              <label class="batch-radio"><input type="radio" name="batchAuthMethod" value="firebase"> Firebase</label>
+            </div>
+          </div>
+
+          <div id="batchTextArea" class="batch-text-area">
+            <div class="batch-section">
+              <label class="batch-mode-label">分隔符</label>
+              <div class="batch-radio-group batch-radio-group--wrap">
+                <label class="batch-radio"><input type="radio" name="batchDelimRadio" value="smart" checked> 智能识别</label>
+                <label class="batch-radio"><input type="radio" name="batchDelimRadio" value="----"> ----</label>
+                <label class="batch-radio"><input type="radio" name="batchDelimRadio" value="\\t"> Tab</label>
+                <label class="batch-radio"><input type="radio" name="batchDelimRadio" value=" "> 空格</label>
+                <label class="batch-radio"><input type="radio" name="batchDelimRadio" value=","> 逗号</label>
+                <label class="batch-radio"><input type="radio" name="batchDelimRadio" value="|"> 竖线</label>
+                <label class="batch-radio"><input type="radio" name="batchDelimRadio" value="custom"> 自定义</label>
+              </div>
+              <input type="text" id="batchCustomDelim" class="batch-custom-delim" placeholder="输入自定义分隔符" hidden>
+            </div>
+            <select id="batchDelimiter" hidden><option value="smart">智能识别</option><option value="----">----</option><option value="\\t">Tab</option><option value=" ">空格</option><option value=",">逗号</option><option value="|">竖线</option><option value="custom">自定义</option></select>
+
+            <label class="batch-hint">智能识别多种格式，直接粘贴即可</label>
+            <textarea id="batchText" class="batch-textarea" rows="6" placeholder="user1@example.com----password123&#10;user2@example.com----abc456789&#10;邮箱：xxx 密码：xxx&#10;auth1_xxxx... 或 devin-session-token$eyJ..."></textarea>
+
+            <details class="batch-example">
+              <summary>格式示例（点击展开）</summary>
+              <div class="batch-example-content">
+                <div class="batch-example-label">邮箱 + 密码（分隔符）</div>
+                <pre class="batch-example-code">user1@example.com----password123
+user2@example.com:abc456789</pre>
+                <div class="batch-example-label" style="margin-top:8px">中文标签格式（单行或多行）</div>
+                <pre class="batch-example-code">邮箱：user@example.com 密码：mypass
+邮箱：user2@example.com
+密码：auth1_xxxxxxxx...</pre>
+                <div class="batch-example-label" style="margin-top:8px">Token 直接导入</div>
+                <pre class="batch-example-code">auth1_xxxxxxxxxxxx...
+devin-session-token$eyJhbGciOi...</pre>
+                <div class="batch-example-label" style="margin-top:8px">💡 密码字段为 auth1_ token 时自动识别</div>
+              </div>
+            </details>
+
+            <button class="primary" data-action="batchImportText">批量导入</button>
+          </div>
+
+          <div id="batchJsonArea" hidden>
+            <label>JSON 数据</label>
+            <textarea id="batchJson" class="batch-textarea" rows="6" placeholder='[{"email":"user1@example.com","password":"pass1"},{"email":"user2@example.com","password":"pass2"}]'></textarea>
+
+            <details class="batch-example">
+              <summary>格式示例（点击展开）</summary>
+              <div class="batch-example-content">
+                <div class="batch-example-label">JSON 示例</div>
+                <pre class="batch-example-code">[
+  {"email": "user1@example.com", "password": "pass1"},
+  {"email": "user2@example.com", "password": "pass2"}
+]</pre>
+              </div>
+            </details>
+
+            <button class="primary" data-action="batchImportJson">批量导入</button>
+          </div>
+
+          <div id="batchDevinArea" hidden>
+            <label class="batch-hint">每行一个 Devin Session Token，自动提取 JWT 并导入。</label>
+            <textarea id="batchDevinText" class="batch-textarea" rows="6" placeholder="devin-session-token$eyJhbGciOiJIUzI1NiIs...&#10;devin-session-token$eyJhbGciOiJIUzI1NiIs..."></textarea>
+
+            <details class="batch-example">
+              <summary>格式示例（点击展开）</summary>
+              <div class="batch-example-content">
+                <div class="batch-example-label">Devin Session Token</div>
+                <pre class="batch-example-code">devin-session-token$eyJhbGciOiJIUzI1NiIs...
+devin-session-token$eyJhbGciOiJIUzI1NiIs...</pre>
+              </div>
+            </details>
+
+            <button class="primary" data-action="batchImportDevin">批量导入</button>
+          </div>
+
+          <div id="batchServerArea" hidden>
+            <div class="batch-section">
+              <label class="batch-mode-label">套餐类型</label>
+              <select id="serverPlanType" class="server-import-input">
+                <option value="All">全部</option>
+                <option value="Free">免费</option>
+                <option value="Trial">试用</option>
+                <option value="Pro">专业</option>
+                <option value="Team">团队</option>
+                <option value="Enterprise">旗舰</option>
+              </select>
+            </div>
+            <div class="batch-section">
+              <label class="batch-mode-label">导入方式</label>
+              <select id="serverCredType" class="server-import-input">
+                <option value="auth1">邮箱 + Auth1 Token</option>
+                <option value="password">邮箱 + 密码</option>
+                <option value="refresh">邮箱 + Refresh Token</option>
+                <option value="apikey">邮箱 + Session/API Key</option>
+              </select>
+            </div>
+            <div class="batch-section">
+              <label class="batch-mode-label">API 地址</label>
+              <input type="text" id="serverBaseUrl" class="server-import-input" value="http://127.0.0.1:46953/api/v1" placeholder="http://127.0.0.1:46953/api/v1">
+            </div>
+            <label class="batch-hint">从服务端读取 /accounts?page=1&page_size=10000，并按所选导入方式导入。</label>
+            <button class="primary" data-action="batchImportServer">服务端导入</button>
+          </div>
+
+          <div id="batchMsg" class="batch-msg" hidden></div>
+        </div>
+
+        <!-- 从当前已登录账户添加 -->
+        <div id="currentAccountArea" hidden>
+          <p class="footnote">将 Windsurf 当前已登录账户的 Session 保存到号池，无需密码。</p>
+          <button class="primary" data-action="addCurrent" style="margin-top:10px">从当前账户添加</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 批量导入模态进度弹窗 -->
+  <div id="batchModalOverlay" class="modal-overlay" hidden>
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3 id="batchModalTitle">批量导入中</h3>
+        <button class="modal-close" id="batchModalClose" title="关闭" hidden>×</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-progress-bar"><div class="modal-progress-fill" id="batchModalFill"></div></div>
+        <div class="modal-progress-text" id="batchModalProgressText">准备中…</div>
+        <div class="modal-current" id="batchModalCurrent"></div>
+        <div class="modal-counts" id="batchModalCounts"></div>
+        <div class="modal-fail-list" id="batchModalFailList" hidden></div>
+        <button class="modal-retry-btn" id="batchModalRetry" hidden>重试失败项</button>
+        <button class="modal-done-btn" id="batchModalDone" hidden>完成</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 通用提示/确认模态弹窗 -->
+  <div id="alertOverlay" class="modal-overlay" hidden>
+    <div class="modal-box" style="width:min(360px,90vw)">
+      <div class="modal-header">
+        <h3 id="alertTitle">提示</h3>
+        <button class="modal-close" id="alertCloseX" title="关闭">×</button>
+      </div>
+      <div class="modal-body">
+        <div id="alertMessage" style="font-size:12.5px;line-height:1.6;word-break:break-word;"></div>
+        <div id="alertActions" class="alert-actions"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 标签编辑弹窗（多标签 picker） -->
+  <div id="tagEditOverlay" class="modal-overlay" hidden>
+    <div class="modal-box" style="width:min(400px,90vw)">
+      <div class="modal-header">
+        <h3 id="tagEditTitle">编辑标签</h3>
+        <button class="modal-close" id="tagEditClose" title="关闭">×</button>
+      </div>
+      <div class="modal-body">
+        <div id="tagEditSelected" class="tag-edit-selected" style="display:flex;flex-wrap:wrap;gap:4px;min-height:28px;margin-bottom:8px;padding:4px 0"></div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <input type="text" id="tagEditInput" placeholder="输入标签名称，回车添加" style="flex:1 1 auto;min-width:0;width:100%;box-sizing:border-box">
+          <button id="tagEditAddBtn" style="flex:0 0 auto;padding:5px 14px;font-size:12px;white-space:nowrap;border-radius:6px;border:1px solid var(--accent,#10b981);background:var(--accent,#10b981);color:#fff;cursor:pointer">添加</button>
+        </div>
+        <div id="tagEditError" class="inst-error" hidden></div>
+        <div style="margin-top:8px">
+          <label style="font-size:11px;opacity:0.7">已有标签（点击添加/移除）</label>
+          <div id="tagEditExisting" class="tag-edit-existing" style="display:flex;flex-wrap:wrap;gap:4px;margin-top:4px;max-height:120px;overflow-y:auto"></div>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:12px;justify-content:flex-end">
+          <button class="modal-cancel-btn" id="tagEditCancel" style="min-width:72px;padding:6px 20px">取消</button>
+          <button class="primary" id="tagEditSave" style="width:auto;min-width:72px;padding:6px 20px">保存</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 全局 Toast 容器（实例操作进度/错误） -->
+  <div id="toastContainer" class="toast-container"></div>
+
+  <script>const vscode = acquireVsCodeApi();</script>
+  <script>${(0, signalBridge_1.getSignalBridgeScript)()}</script>
+  <script>${(0, signalBridge_1.getBridgeRelayScript)()}</script>
+  <script src="${jsUri}"></script>
+</body>
+</html>`;
+    }
+    dispose() {
+        this._disposables.forEach(d => { try {
+            d.dispose();
+        }
+        catch { /* ignore */ } });
+        this._disposables = [];
+        try {
+            this._output.dispose();
+        }
+        catch { /* ignore */ }
+    }
+}
+exports.SidebarProvider = SidebarProvider;
+//# sourceMappingURL=sidebarProvider.js.map

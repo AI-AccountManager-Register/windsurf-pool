@@ -1,0 +1,191 @@
+"use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.postProbe = postProbe;
+exports.post = post;
+const https = __importStar(require("https"));
+/**
+ * HTTPS POST 辅助函数
+ * 独立 agent：绕过 VS Code 注入的全局代理 agent，直连出站
+ */
+const directAgent = new https.Agent({
+    keepAlive: true,
+    keepAliveMsecs: 30000,
+    timeout: 15000,
+    maxSockets: 6,
+});
+const REQUEST_TIMEOUT_MS = 15000;
+const MAX_RETRIES = 2;
+const RETRY_DELAY_MS = 1500;
+const RETRYABLE_CODES = ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'EAI_AGAIN'];
+function isRetryable(err) {
+    const code = err?.code || '';
+    const msg = err?.message || '';
+    if (RETRYABLE_CODES.includes(code))
+        return true;
+    if (msg.includes('socket disconnected') || msg.includes('TLS') || msg.includes('ECONNRESET'))
+        return true;
+    return false;
+}
+function delay(ms) {
+    return new Promise(r => setTimeout(r, ms));
+}
+function postOnce(url, body, headers = {}) {
+    return new Promise((resolve, reject) => {
+        const urlObj = new URL(url);
+        const data = JSON.stringify(body);
+        const options = {
+            hostname: urlObj.hostname,
+            port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
+            path: urlObj.pathname + urlObj.search,
+            method: 'POST',
+            agent: directAgent,
+            timeout: REQUEST_TIMEOUT_MS,
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(data),
+                ...headers
+            }
+        };
+        const req = https.request(options, (res) => {
+            let buf = '';
+            res.on('data', (chunk) => buf += chunk);
+            res.on('end', () => resolve({ status: res.statusCode || 0, body: buf }));
+        });
+        req.on('timeout', () => {
+            req.destroy(new Error('Request timeout'));
+        });
+        req.on('error', reject);
+        req.write(data);
+        req.end();
+    });
+}
+/**
+ * 探测性 POST：发送请求后只等第一个数据块或 HTTP 状态，立即销毁连接。
+ * 适用于 streaming RPC 端点（如 GetChatMessage），不消耗完整响应。
+ * timeoutMs 默认 20s
+ */
+function postProbe(url, body, headers = {}, timeoutMs = 20000, signal) {
+    return new Promise((resolve, reject) => {
+        const urlObj = new URL(url);
+        const data = JSON.stringify(body);
+        let resolved = false;
+        const done = (status, bodyStr) => {
+            if (resolved)
+                return;
+            resolved = true;
+            try {
+                req.destroy();
+            }
+            catch { }
+            resolve({ status, body: bodyStr });
+        };
+        // 提前检查 abort
+        if (signal?.aborted) {
+            resolve({ status: 0, body: 'aborted' });
+            return;
+        }
+        const options = {
+            hostname: urlObj.hostname,
+            port: urlObj.port || 443,
+            path: urlObj.pathname + urlObj.search,
+            method: 'POST',
+            agent: directAgent,
+            timeout: timeoutMs,
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(data),
+                ...headers
+            }
+        };
+        const req = https.request(options, (res) => {
+            const status = res.statusCode || 0;
+            // 非 200 直接返回（401/403/429 等）
+            if (status !== 200) {
+                let buf = '';
+                res.on('data', (chunk) => { buf += chunk; if (buf.length > 1000)
+                    done(status, buf); });
+                res.on('end', () => done(status, buf));
+                return;
+            }
+            // 200：收集前 2000 字节数据作为证明
+            let buf = '';
+            res.on('data', (chunk) => {
+                buf += chunk;
+                if (buf.length >= 500)
+                    done(status, buf.slice(0, 2000));
+            });
+            res.on('end', () => done(status, buf));
+        });
+        // abort 监听：立即销毁连接
+        if (signal) {
+            const onAbort = () => { done(0, 'aborted'); };
+            signal.addEventListener('abort', onAbort, { once: true });
+            // 清理
+            const origDone = done;
+            // req 完成后移除监听
+            req.on('close', () => signal.removeEventListener('abort', onAbort));
+        }
+        req.on('timeout', () => {
+            done(0, 'timeout');
+        });
+        req.on('error', (err) => {
+            if (!resolved) {
+                resolved = true;
+                reject(err);
+            }
+        });
+        req.write(data);
+        req.end();
+    });
+}
+async function post(url, body, headers = {}) {
+    let lastErr;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        try {
+            return await postOnce(url, body, headers);
+        }
+        catch (err) {
+            lastErr = err;
+            if (attempt < MAX_RETRIES && isRetryable(err)) {
+                await delay(RETRY_DELAY_MS * (attempt + 1));
+                continue;
+            }
+            throw err;
+        }
+    }
+    throw lastErr;
+}
+//# sourceMappingURL=httpClient.js.map

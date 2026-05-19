@@ -1,0 +1,52 @@
+.vscode/**
+.vscode-test/**
+
+# Source / 工程配置
+src/**
+**/*.map
+**/tsconfig.json
+**/.eslintrc*
+**/.editorconfig
+**/.prettierrc*
+
+# Git
+.git/**
+.github/**
+.gitignore
+.gitattributes
+
+# 临时与缓存
+node_modules/**
+**/.DS_Store
+**/Thumbs.db
+**/*.log
+
+# 7.4.0 误打包的研发资料 (7.5.3 已瘦身)
+orderProject/**
+docs/**
+
+# 设计稿/演示页 (运行时不加载)
+battery-report.html
+full_dashboard_demo.html
+liquid_glass_components.html
+windsurf-pool-liquid-glass.html
+plugin_panel.html
+index.html
+resources/webview/full-panels-demo.html
+resources/webview/auto-switch-design.html
+resources/webview/panels-preview.html
+resources/webview/multi-instance-panel.html
+resources/webview/auto-continue-preview.html
+
+# 不必要的图片与文档备份
+苏文微信赞赏码.jpg
+qqqun.jpg
+wechat-reward.jpg
+wechat-reward.webp
+cascade-chat-protocol.md
+
+# 上传/发布脚本 (build-time only)
+scripts/**
+
+# 开发时文档
+BUILD.md

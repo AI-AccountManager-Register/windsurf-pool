@@ -1,0 +1,86 @@
+name: Build and Release VSIX
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version, for example 7.5.4. Leave empty to use package.json version.'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish VSIX
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          INPUT_VERSION="${{ github.event.inputs.version }}"
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="${INPUT_VERSION#v}"
+            npm version "$VERSION" --no-git-tag-version --allow-same-version
+          else
+            VERSION="$(node -p "require('./package.json').version")"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $VERSION"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --include=dev
+          else
+            npm install --include=dev
+          fi
+
+      - name: Package VSIX
+        run: npm run package
+
+      - name: Locate VSIX
+        id: vsix
+        shell: bash
+        run: |
+          VSIX="windsurf-pool-${{ steps.version.outputs.version }}.vsix"
+          if [ ! -f "$VSIX" ]; then
+            VSIX="$(ls -1 *.vsix | head -n 1)"
+          fi
+          if [ ! -f "$VSIX" ]; then
+            echo "No VSIX file found" >&2
+            exit 1
+          fi
+          echo "path=$VSIX" >> "$GITHUB_OUTPUT"
+          echo "Found VSIX: $VSIX"
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          VSIX: ${{ steps.vsix.outputs.path }}
+        shell: bash
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$VSIX" --clobber
+          else
+            gh release create "$TAG" "$VSIX" \
+              --title "Windsurf Pool $VERSION" \
+              --notes "Windsurf Pool $VERSION" \
+              --latest
+          fi
