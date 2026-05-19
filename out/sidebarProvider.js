@@ -2972,6 +2972,7 @@ class SidebarProvider {
           <option value="daily">日配额</option>
           <option value="weekly">周配额</option>
           <option value="planEnd">到期日</option>
+          <option value="plan">套餐类型</option>
           <option value="email">邮箱 A-Z</option>
           <option value="created">添加时间</option>
         </select>

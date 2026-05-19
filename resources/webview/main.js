@@ -561,49 +561,43 @@
       <div class="grid-card-head">
         <svg class="grid-account-avatar" data-action="copyEmail" title="复制邮箱" viewBox="0 0 32 32" role="button" aria-label="复制邮箱"><circle cx="16" cy="16" r="15"></circle><text x="16" y="20.5" text-anchor="middle">${escHtml(getAccountInitial(account.email))}</text></svg>
         <div class="grid-card-email" data-action="copyEmail" title="点击复制邮箱：${escHtml(displayEmail(account.email))}">${escHtml(displayEmail(account.email))}</div>
+        <button class="status-toggle-btn ${account.disabled ? 'is-disabled' : 'is-enabled'}" data-action="toggleDisabled" title="${account.disabled ? '点击启用账号' : '点击禁用账号'}">${account.disabled ? '已禁用' : '已启用'}</button>
         ${isActive ? '<span class="grid-active-tag">当前</span>' : ''}
         ${!isActive && lockedEmails.has(account.email) ? '<span class="grid-locked-tag" title="被其他窗口占用中">🔒 占用</span>' : ''}
-        ${account.disabled ? '<span class="grid-disabled-tag">已禁用</span>' : ''}
       </div>
       <div class="grid-card-meta">
         <span class="grid-plan-chip ${snap ? planTierClass(snap.planName) : ''}" data-field="plan">${snap ? escHtml(snap.planName || 'Unknown') : '...'}</span>
         ${tagHtml}
-        ${buildHealthBadge(account.email)}
-        ${buildSwitchIssueBadge(account.email)}
-      </div>
-      <div class="grid-card-quotas">
-        <div class="grid-quota-item">
-          <div class="grid-quota-head"><span>日配额</span><span data-field="dailyPct" class="grid-quota-val ${snap ? pctClass(snap.dailyRemainingPercent) : ''}">${snap ? Math.round(snap.dailyRemainingPercent) + '%' : '—'}</span></div>
-          <div class="quota-bar"><div class="quota-bar-fill ${snap ? pctClass(snap.dailyRemainingPercent) : ''}" data-field="dailyBar" style="width:${snap ? snap.dailyRemainingPercent : 0}%"></div></div>
-          <div class="grid-quota-reset" data-field="dailyReset">${snap ? formatUnix(snap.dailyResetAtUnix) : '—'}</div>
-        </div>
-        <div class="grid-quota-item">
-          <div class="grid-quota-head"><span>周配额</span><span data-field="weeklyPct" class="grid-quota-val ${snap ? pctClass(snap.weeklyRemainingPercent) : ''}">${snap ? Math.round(snap.weeklyRemainingPercent) + '%' : '—'}</span></div>
-          <div class="quota-bar"><div class="quota-bar-fill ${snap ? pctClass(snap.weeklyRemainingPercent) : ''}" data-field="weeklyBar" style="width:${snap ? snap.weeklyRemainingPercent : 0}%"></div></div>
-          <div class="grid-quota-reset" data-field="weeklyReset">${snap ? formatUnix(snap.weeklyResetAtUnix) : '—'}</div>
-        </div>
-      </div>
-      <div class="grid-card-extra">
-        <div class="grid-extra-row"><span>额外用量余额</span><span class="grid-extra-val" data-field="flexCredits">${snap && snap.overageBalanceMicros !== undefined ? '$' + (snap.overageBalanceMicros / 1000000).toFixed(2) : '—'}</span></div>
-        <div class="grid-extra-row"><span>会员期限</span><span class="grid-extra-val ${snap && snap.planEnd ? periodClass(snap.planEnd) : ''}" data-field="period">${snap && snap.planStart && snap.planEnd ? formatPeriodSimple(snap.planStart, snap.planEnd) : '—'}</span></div>
-        <div class="grid-extra-row"><span>今日切号</span><span class="grid-extra-val" data-field="switchCount">${perAccountStats[account.email]?.switchToCount || 0} 次</span></div>
-      </div>
-      ${buildSwitchIssueRow(account.email)}
-      <div class="grid-card-actions">
-        ${isActive
-          ? '<span class="grid-current-label"><span style="color:#3fb950">●</span> 使用中</span>'
-          : `<button class="grid-switch-btn" data-action="switch" ${switchingEmail === account.email ? 'disabled' : ''}>${switchingEmail === account.email ? '<span class="btn-mini-spinner"></span>检查中' : '切换'}</button>`
-        }
-        <div class="grid-actions-right">
-          <button class="status-toggle-btn ${account.disabled ? 'is-disabled' : 'is-enabled'}" data-action="toggleDisabled" title="${account.disabled ? '点击启用账号' : '点击禁用账号'}">${account.disabled ? '已禁用' : '已启用'}</button>
+        <span class="grid-inline-actions">
+          ${isActive
+            ? '<span class="grid-current-dot" title="当前使用中"><span style="color:#3fb950">●</span></span>'
+            : `<button class="icon-btn grid-switch-icon" data-action="switch" title="切换账号" ${switchingEmail === account.email ? 'disabled' : ''}>${switchingEmail === account.email ? '<span class="btn-mini-spinner"></span>' : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M4 20 21 3"/><path d="M21 16v5h-5"/><path d="M15 15l6 6"/><path d="M4 4l5 5"/></svg>'}</button>`
+          }
           <button class="icon-btn" data-action="refresh" title="刷新配额">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
           </button>
           <button class="icon-btn danger" data-action="delete" title="删除账号">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
           </button>
+        </span>
+        ${buildHealthBadge(account.email)}
+        ${buildSwitchIssueBadge(account.email)}
+      </div>
+      <div class="grid-card-quotas">
+        <div class="grid-quota-item">
+          <div class="grid-quota-head"><span>日配额</span><span class="grid-quota-side"><span data-field="dailyPct" class="grid-quota-val ${snap ? pctClass(snap.dailyRemainingPercent) : ''}">${snap ? Math.round(snap.dailyRemainingPercent) + '%' : '—'}</span><span class="grid-quota-reset" data-field="dailyReset">${snap ? formatUnix(snap.dailyResetAtUnix) : '—'}</span></span></div>
+          <div class="quota-bar"><div class="quota-bar-fill ${snap ? pctClass(snap.dailyRemainingPercent) : ''}" data-field="dailyBar" style="width:${snap ? snap.dailyRemainingPercent : 0}%"></div></div>
+        </div>
+        <div class="grid-quota-item">
+          <div class="grid-quota-head"><span>周配额</span><span class="grid-quota-side"><span data-field="weeklyPct" class="grid-quota-val ${snap ? pctClass(snap.weeklyRemainingPercent) : ''}">${snap ? Math.round(snap.weeklyRemainingPercent) + '%' : '—'}</span><span class="grid-quota-reset" data-field="weeklyReset">${snap ? formatUnix(snap.weeklyResetAtUnix) : '—'}</span></span></div>
+          <div class="quota-bar"><div class="quota-bar-fill ${snap ? pctClass(snap.weeklyRemainingPercent) : ''}" data-field="weeklyBar" style="width:${snap ? snap.weeklyRemainingPercent : 0}%"></div></div>
         </div>
       </div>
+      <div class="grid-card-extra">
+        <div class="grid-extra-row"><span>额外用量余额</span><span class="grid-extra-right"><span class="grid-extra-val" data-field="flexCredits">${snap && snap.overageBalanceMicros !== undefined ? '$' + (snap.overageBalanceMicros / 1000000).toFixed(2) : '—'}</span><span class="grid-extra-today">今日 <span data-field="switchCount">${perAccountStats[account.email]?.switchToCount || 0} 次</span></span></span></div>
+        <div class="grid-extra-row"><span>会员期限</span><span class="grid-extra-val ${snap && snap.planEnd ? periodClass(snap.planEnd) : ''}" data-field="period">${snap && snap.planStart && snap.planEnd ? formatPeriodSimple(snap.planStart, snap.planEnd) : '—'}</span></div>
+      </div>
+      ${buildSwitchIssueRow(account.email)}
       <div class="grid-card-error" ${err ? '' : 'hidden'}>${err ? escHtml(err) : ''}</div>
       </div>
     `;
@@ -744,6 +738,22 @@
         const va = sa?.planEnd ? new Date(sa.planEnd).getTime() : Infinity;
         const vb = sb?.planEnd ? new Date(sb.planEnd).getTime() : Infinity;
         return (va - vb) * dir;
+      }
+      case 'plan': {
+        if (has(sa) !== has(sb)) return has(sb) - has(sa);
+        const rank = (name) => {
+          const n = String(name || '').toLowerCase();
+          if (n.includes('enterprise')) return 5;
+          if (n.includes('team')) return 4;
+          if (n.includes('pro')) return 3;
+          if (n.includes('trial')) return 2;
+          if (n.includes('free')) return 1;
+          return 0;
+        };
+        const va = rank(sa?.planName);
+        const vb = rank(sb?.planName);
+        if (va !== vb) return (vb - va) * dir;
+        return String(sa?.planName || '').localeCompare(String(sb?.planName || '')) * dir;
       }
       case 'email':
         return (a.email || '').localeCompare(b.email || '') * dir;
