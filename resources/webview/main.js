@@ -769,19 +769,26 @@
 
   function renderPagerControl(pager, total, maxPage, compact) {
     if (!pager || maxPage <= 1) return;
-    const pageOptions = Array.from({ length: maxPage }, (_, i) => `<option value="${i + 1}" ${currentPage === i + 1 ? 'selected' : ''}>${i + 1}</option>`).join('');
+    const pageOptions = Array.from({ length: maxPage }, (_, i) => {
+      const page = i + 1;
+      return `<button type="button" class="pager-page-option${currentPage === page ? ' is-current' : ''}" data-page-value="${page}">${page}</button>`;
+    }).join('');
     pager.innerHTML = `
       <button class="pager-btn" data-page="prev" ${currentPage <= 1 ? 'disabled' : ''}>&lt;</button>
       <span class="pager-jump-wrap">
-        <input class="pager-jump-input" type="number" min="1" max="${maxPage}" value="${currentPage}" inputmode="numeric" aria-label="输入页码跳转">
-        <select class="pager-page-select" title="选择页码" aria-label="选择页码">${pageOptions}</select>
+        <span class="pager-combo">
+          <input class="pager-jump-input" type="number" min="1" max="${maxPage}" value="${currentPage}" inputmode="numeric" aria-label="输入页码跳转">
+          <button type="button" class="pager-combo-toggle" title="选择页码" aria-label="选择页码">▾</button>
+          <span class="pager-page-menu${compact ? '' : ' pager-page-menu--up'}" hidden>${pageOptions}</span>
+        </span>
         <span class="pager-info">/ ${maxPage}</span>
       </span>
       <button class="pager-btn" data-page="next" ${currentPage >= maxPage ? 'disabled' : ''}>&gt;</button>
       ${compact ? '' : `<span class="pager-info pager-total">共 ${total} 个</span>`}
     `;
     const jumpInput = pager.querySelector('.pager-jump-input');
-    const pageSelect = pager.querySelector('.pager-page-select');
+    const comboToggle = pager.querySelector('.pager-combo-toggle');
+    const pageMenu = pager.querySelector('.pager-page-menu');
     const jumpToPage = (value) => {
       const nextPage = Math.max(1, Math.min(maxPage, parseInt(value, 10) || currentPage));
       if (nextPage !== currentPage) {
@@ -790,20 +797,34 @@
         return;
       }
       if (jumpInput) jumpInput.value = String(currentPage);
-      if (pageSelect) pageSelect.value = String(currentPage);
     };
+    const hideMenu = () => { if (pageMenu) pageMenu.hidden = true; };
     if (jumpInput) {
       jumpInput.addEventListener('change', () => jumpToPage(jumpInput.value));
-      jumpInput.addEventListener('blur', () => jumpToPage(jumpInput.value));
+      jumpInput.addEventListener('blur', () => {
+        setTimeout(hideMenu, 120);
+        jumpToPage(jumpInput.value);
+      });
       jumpInput.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') {
           e.preventDefault();
           jumpToPage(jumpInput.value);
         }
+        if (e.key === 'Escape') {
+          hideMenu();
+        }
       });
     }
-    if (pageSelect) {
-      pageSelect.addEventListener('change', () => jumpToPage(pageSelect.value));
+    if (comboToggle && pageMenu) {
+      comboToggle.addEventListener('click', (e) => {
+        e.preventDefault();
+        pageMenu.hidden = !pageMenu.hidden;
+        if (!pageMenu.hidden) jumpInput?.focus();
+      });
+      pageMenu.querySelectorAll('.pager-page-option').forEach(option => {
+        option.addEventListener('mousedown', (e) => e.preventDefault());
+        option.addEventListener('click', () => jumpToPage(option.dataset.pageValue));
+      });
     }
     pager.querySelectorAll('.pager-btn').forEach(btn => {
       btn.addEventListener('click', () => {
