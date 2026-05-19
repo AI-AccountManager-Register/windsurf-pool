@@ -815,13 +815,38 @@
         const maxPage = Math.ceil(total / pageSize);
         const pager = document.createElement('div');
         pager.className = 'pager-bar';
+        const pageOptions = Array.from({ length: maxPage }, (_, i) => `<option value="${i + 1}">${i + 1}</option>`).join('');
         pager.innerHTML = `
           <button class="pager-btn" data-page="prev" ${currentPage <= 1 ? 'disabled' : ''}>&lt;</button>
-          <span class="pager-info">${currentPage} / ${maxPage}</span>
+          <span class="pager-jump-wrap">
+            <input class="pager-jump-input" list="pagerPageList" value="${currentPage}" inputmode="numeric" pattern="[0-9]*" aria-label="输入页码跳转">
+            <datalist id="pagerPageList">${pageOptions}</datalist>
+            <span class="pager-info">/ ${maxPage}</span>
+          </span>
           <button class="pager-btn" data-page="next" ${currentPage >= maxPage ? 'disabled' : ''}>&gt;</button>
           <span class="pager-info pager-total">共 ${total} 个</span>
         `;
         frag.appendChild(pager);
+        const jumpInput = pager.querySelector('.pager-jump-input');
+        const jumpToPage = () => {
+          const nextPage = Math.max(1, Math.min(maxPage, parseInt(jumpInput.value, 10) || currentPage));
+          if (nextPage !== currentPage) {
+            currentPage = nextPage;
+            renderCards();
+            return;
+          }
+          jumpInput.value = String(currentPage);
+        };
+        if (jumpInput) {
+          jumpInput.addEventListener('change', jumpToPage);
+          jumpInput.addEventListener('blur', jumpToPage);
+          jumpInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              jumpToPage();
+            }
+          });
+        }
         pager.querySelectorAll('.pager-btn').forEach(btn => {
           btn.addEventListener('click', () => {
             if (btn.dataset.page === 'prev' && currentPage > 1) { currentPage--; renderCards(); }

@@ -3385,7 +3385,7 @@ body.vscode-high-contrast-light .grid-force-switch-btn { background: rgba(99, 10
 body.vscode-high-contrast-light .grid-force-switch-btn:hover { background: rgba(99, 102, 241, 0.18); border-color: rgba(67, 56, 202, 0.6); color: #3730a3; }
 body.vscode-high-contrast-light .grid-locked-tag { color: #4338ca; background: rgba(99, 102, 241, 0.12); }
 
-/* ═══════ Pager Bar (simple prev/next) ═══════ */
+/* ═══════ Pager Bar ═══════ */
 .pager-bar {
     display: flex;
     align-items: center;
@@ -3413,6 +3413,29 @@ body.vscode-high-contrast-light .grid-locked-tag { color: #4338ca; background: r
     border-color: var(--card-border);
 }
 .pager-info { font-size: 12px; color: var(--muted); font-family: var(--vscode-editor-font-family, monospace); }
+.pager-jump-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 12px;
+}
+.pager-jump-input {
+    width: 42px;
+    height: 26px;
+    padding: 2px 6px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--card-border);
+    background: var(--elevated-bg);
+    color: var(--vscode-foreground);
+    font-size: 12px;
+    font-family: var(--vscode-editor-font-family, monospace);
+    text-align: center;
+    outline: none;
+}
+.pager-jump-input:focus {
+    border-color: var(--ac-emerald);
+    box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.18);
+}
 
 /* ═══════ Group Header ═══════ */
 .group-header {
