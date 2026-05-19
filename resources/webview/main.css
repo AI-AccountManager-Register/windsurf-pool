@@ -3436,6 +3436,38 @@ body.vscode-high-contrast-light .grid-locked-tag { color: #4338ca; background: r
     border-color: var(--ac-emerald);
     box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.18);
 }
+.pager-page-select {
+    height: 26px;
+    min-width: 46px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--card-border);
+    background: var(--elevated-bg);
+    color: var(--vscode-foreground);
+    font-size: 12px;
+    font-family: var(--vscode-editor-font-family, monospace);
+    outline: none;
+}
+.pager-page-select:focus {
+    border-color: var(--ac-emerald);
+    box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.18);
+}
+.toolbar-pager {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    margin-left: 2px;
+}
+.toolbar-pager .pager-btn {
+    height: 24px;
+    padding: 3px 8px;
+}
+.toolbar-pager .pager-jump-input,
+.toolbar-pager .pager-page-select {
+    height: 24px;
+}
+.toolbar-pager .pager-jump-input {
+    width: 38px;
+}
 
 /* ═══════ Group Header ═══════ */
 .group-header {

@@ -767,6 +767,64 @@
     }
   }
 
+  function renderPagerControl(pager, total, maxPage, compact) {
+    if (!pager || maxPage <= 1) return;
+    const pageOptions = Array.from({ length: maxPage }, (_, i) => `<option value="${i + 1}" ${currentPage === i + 1 ? 'selected' : ''}>${i + 1}</option>`).join('');
+    pager.innerHTML = `
+      <button class="pager-btn" data-page="prev" ${currentPage <= 1 ? 'disabled' : ''}>&lt;</button>
+      <span class="pager-jump-wrap">
+        <input class="pager-jump-input" type="number" min="1" max="${maxPage}" value="${currentPage}" inputmode="numeric" aria-label="输入页码跳转">
+        <select class="pager-page-select" title="选择页码" aria-label="选择页码">${pageOptions}</select>
+        <span class="pager-info">/ ${maxPage}</span>
+      </span>
+      <button class="pager-btn" data-page="next" ${currentPage >= maxPage ? 'disabled' : ''}>&gt;</button>
+      ${compact ? '' : `<span class="pager-info pager-total">共 ${total} 个</span>`}
+    `;
+    const jumpInput = pager.querySelector('.pager-jump-input');
+    const pageSelect = pager.querySelector('.pager-page-select');
+    const jumpToPage = (value) => {
+      const nextPage = Math.max(1, Math.min(maxPage, parseInt(value, 10) || currentPage));
+      if (nextPage !== currentPage) {
+        currentPage = nextPage;
+        renderCards();
+        return;
+      }
+      if (jumpInput) jumpInput.value = String(currentPage);
+      if (pageSelect) pageSelect.value = String(currentPage);
+    };
+    if (jumpInput) {
+      jumpInput.addEventListener('change', () => jumpToPage(jumpInput.value));
+      jumpInput.addEventListener('blur', () => jumpToPage(jumpInput.value));
+      jumpInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          jumpToPage(jumpInput.value);
+        }
+      });
+    }
+    if (pageSelect) {
+      pageSelect.addEventListener('change', () => jumpToPage(pageSelect.value));
+    }
+    pager.querySelectorAll('.pager-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        if (btn.dataset.page === 'prev' && currentPage > 1) { currentPage--; renderCards(); }
+        else if (btn.dataset.page === 'next' && currentPage < maxPage) { currentPage++; renderCards(); }
+      });
+    });
+  }
+
+  function updateToolbarPager(total, maxPage) {
+    const toolbarPager = document.getElementById('toolbarPager');
+    if (!toolbarPager) return;
+    const show = groupBy === 'none' && pageSize > 0 && total > pageSize && maxPage > 1;
+    toolbarPager.hidden = !show;
+    if (!show) {
+      toolbarPager.innerHTML = '';
+      return;
+    }
+    renderPagerControl(toolbarPager, total, maxPage, true);
+  }
+
   function renderCards() {
     if (!accountGrid) return;
 
@@ -807,54 +865,20 @@
         const start = (currentPage - 1) * pageSize;
         pageItems = sorted.slice(start, start + pageSize);
       }
+      const maxPage = pageSize > 0 && total > pageSize ? Math.ceil(total / pageSize) : 1;
+      updateToolbarPager(total, maxPage);
       pageItems.forEach(account => {
         frag.appendChild(buildCard(account, account.email === lastEmail));
       });
       // 分页控件
       if (pageSize > 0 && total > pageSize) {
-        const maxPage = Math.ceil(total / pageSize);
         const pager = document.createElement('div');
         pager.className = 'pager-bar';
-        const pageOptions = Array.from({ length: maxPage }, (_, i) => `<option value="${i + 1}">${i + 1}</option>`).join('');
-        pager.innerHTML = `
-          <button class="pager-btn" data-page="prev" ${currentPage <= 1 ? 'disabled' : ''}>&lt;</button>
-          <span class="pager-jump-wrap">
-            <input class="pager-jump-input" list="pagerPageList" value="${currentPage}" inputmode="numeric" pattern="[0-9]*" aria-label="输入页码跳转">
-            <datalist id="pagerPageList">${pageOptions}</datalist>
-            <span class="pager-info">/ ${maxPage}</span>
-          </span>
-          <button class="pager-btn" data-page="next" ${currentPage >= maxPage ? 'disabled' : ''}>&gt;</button>
-          <span class="pager-info pager-total">共 ${total} 个</span>
-        `;
+        renderPagerControl(pager, total, maxPage, false);
         frag.appendChild(pager);
-        const jumpInput = pager.querySelector('.pager-jump-input');
-        const jumpToPage = () => {
-          const nextPage = Math.max(1, Math.min(maxPage, parseInt(jumpInput.value, 10) || currentPage));
-          if (nextPage !== currentPage) {
-            currentPage = nextPage;
-            renderCards();
-            return;
-          }
-          jumpInput.value = String(currentPage);
-        };
-        if (jumpInput) {
-          jumpInput.addEventListener('change', jumpToPage);
-          jumpInput.addEventListener('blur', jumpToPage);
-          jumpInput.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') {
-              e.preventDefault();
-              jumpToPage();
-            }
-          });
-        }
-        pager.querySelectorAll('.pager-btn').forEach(btn => {
-          btn.addEventListener('click', () => {
-            if (btn.dataset.page === 'prev' && currentPage > 1) { currentPage--; renderCards(); }
-            else if (btn.dataset.page === 'next' && currentPage < maxPage) { currentPage++; renderCards(); }
-          });
-        });
       }
     } else {
+      updateToolbarPager(0, 1);
       // 分组渲染
       const groups = new Map();
       sorted.forEach(account => {

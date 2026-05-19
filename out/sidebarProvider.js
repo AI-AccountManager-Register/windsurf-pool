@@ -3008,6 +3008,7 @@ class SidebarProvider {
           </svg>
         </button>
         <button class="quick-health-filter-btn" id="quickHealthOkBtn" title="只显示测活结果为可用的账号">可用</button>
+        <span class="toolbar-pager" id="toolbarPager" hidden></span>
         <div style="flex:1"></div>
         <select class="page-size-select" id="pageSizeSelect" title="每页显示">
           <option value="10">10/页</option>
