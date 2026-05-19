@@ -50,3 +50,7 @@ scripts/**
 
 # 开发时文档
 BUILD.md
+
+# 构建产物（避免再次被打入新 vsix）
+*.vsix
+windsurf-pool-*.vsix

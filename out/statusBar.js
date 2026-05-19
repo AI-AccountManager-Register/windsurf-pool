@@ -58,13 +58,14 @@ const DEFAULTS = {
     showPool: true,
     showAutoSwitch: true,
     showInstance: true,
+    showSwitches: true,
 };
 const VALID_STYLES = ['dot', 'percent', 'compact', 'dual', 'labeled', 'full'];
 const VALID_POSITIONS = ['left', 'right'];
 const MENU_CMD = 'windsurfPool.statusBarMenu';
 const REFRESH_CMD = 'windsurfPool.statusBarRefresh';
 class StatusBarManager {
-    constructor(ctx, auto) {
+    constructor(ctx, auto, tracker) {
         this._disposables = [];
         this._cooldownTimer = null;
         this._redrawTimer = null;
@@ -72,6 +73,7 @@ class StatusBarManager {
         this._currentAlignment = vscode.StatusBarAlignment.Left;
         this._ctx = ctx;
         this._auto = auto;
+        this._tracker = tracker || null;
         this._left = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
         this._left.command = 'windsurfPool.openSidebar';
         this._right = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
@@ -133,6 +135,7 @@ class StatusBarManager {
                 showPool: sb.showPool !== false,
                 showAutoSwitch: sb.showAutoSwitch !== false,
                 showInstance: sb.showInstance !== false,
+                showSwitches: sb.showSwitches !== false,
             };
         }
         catch {
@@ -304,6 +307,12 @@ class StatusBarManager {
                 parts.push('$(circle-slash) 手动');
             }
         }
+        if (cfg.showSwitches) {
+            const todaySwitches = this._getTodaySwitches();
+            if (todaySwitches >= 0) {
+                parts.push(`$(arrow-swap) ${todaySwitches}`);
+            }
+        }
         if (parts.length === 0) {
             this._right.hide();
             return;
@@ -339,6 +348,13 @@ class StatusBarManager {
                 available++;
         }
         return { available, total };
+    }
+    _getTodaySwitches() {
+        try {
+            const stats = this._tracker?.getStats?.();
+            if (!stats || typeof stats.totalSwitches !== 'number') return -1;
+            return stats.totalSwitches;
+        } catch { return -1; }
     }
     _scheduleCooldownRefresh() {
         if (this._cooldownTimer)

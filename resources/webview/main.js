@@ -305,6 +305,8 @@
   let filterTags = new Set();    // 标签
   let filterStatuses = new Set(); // 状态
   let filterHealth = new Set();  // 测活结果
+  let quickFaultOn = false;       // 顶部「故障」快速过滤
+  let quickFullOn = false;        // 顶部「满额」快速过滤
 
   // 兼容旧分组逻辑（现在不做分组，只过滤）
   let groupBy = 'none';
@@ -373,6 +375,16 @@
     }
     if (filterStatuses.size > 0 && !filterStatuses.has(getAccountStatus(account))) return false;
     if (filterHealth.size > 0 && !filterHealth.has(getHealthStatus(account.email))) return false;
+    if (quickFaultOn) {
+      const hs = getHealthStatus(account.email);
+      if (hs === '可用' || hs === '未检测') return false;
+    }
+    if (quickFullOn) {
+      const snap = usageCache.get(account.email)?.snapshot;
+      if (!snap) return false;
+      if ((snap.dailyRemainingPercent ?? 0) < 80) return false;
+      if ((snap.weeklyRemainingPercent ?? 0) < 80) return false;
+    }
     return true;
   }
 
@@ -530,6 +542,32 @@
     const value = String(email || '').trim();
     const ch = value.charAt(0) || '?';
     return ch.toUpperCase();
+  }
+
+  /** 计算卡片签名，相同签名时跳过重建（renderCards 增量复用） */
+  function computeCardSignature(account, isActive) {
+    const snap = usageCache.get(account.email)?.snapshot;
+    const issue = getAccountIssue(account.email);
+    const lock = lockedEmailsMap[account.email] ? '1' : '0';
+    const switching = switchingEmail === account.email ? '1' : '0';
+    const hc = getHealthEntry(account.email);
+    const tags = (Array.isArray(account.tags) ? account.tags : (account.tag ? [account.tag] : [])).join(',');
+    const stat = perAccountStats[account.email];
+    return [
+      account.email,
+      isActive ? '1' : '0',
+      account.disabled ? '1' : '0',
+      snap ? `${snap.planName || ''}:${Math.round(snap.dailyRemainingPercent||0)}:${Math.round(snap.weeklyRemainingPercent||0)}:${snap.overageBalanceMicros||0}:${snap.planStart||''}:${snap.planEnd||''}` : '0',
+      issue ? (issue.text || JSON.stringify(issue)).slice(0, 64) : '',
+      lock,
+      switching,
+      hc ? `${hc.testing ? 't' : (hc.ok ? 'k' : 'f')}:${(hc.reason || '').slice(0, 64)}:${hc.ts || 0}` : 'n',
+      tags,
+      selectMode ? '1' : '0',
+      selectedEmails.has(account.email) ? 's' : '_',
+      stat ? `c:${stat.switchToCount||0}` : 'c:0',
+      privacyMode ? 'p' : 'P',
+    ].join('|');
   }
 
   function buildCard(account, isActive) {
@@ -888,8 +926,24 @@
       }
       const maxPage = pageSize > 0 && total > pageSize ? Math.ceil(total / pageSize) : 1;
       updateToolbarPager(total, maxPage);
+      // 增量复用：按 email 命中已有卡片，且 signature 未变即跳过重建
+      const oldByEmail = new Map();
+      try {
+        accountGrid.querySelectorAll(':scope > .grid-card[data-email]').forEach(el => {
+          oldByEmail.set(el.dataset.email, el);
+        });
+      } catch {}
       pageItems.forEach(account => {
-        frag.appendChild(buildCard(account, account.email === lastEmail));
+        const isActive = account.email === lastEmail;
+        const sig = computeCardSignature(account, isActive);
+        let card = oldByEmail.get(account.email);
+        if (card && card.dataset.sig === sig) {
+          oldByEmail.delete(account.email);
+        } else {
+          card = buildCard(account, isActive);
+          card.dataset.sig = sig;
+        }
+        frag.appendChild(card);
       });
       // 分页控件
       if (pageSize > 0 && total > pageSize) {
@@ -2587,6 +2641,132 @@
     vscode.postMessage({ type, ...data });
   }
 
+  // ==================== 卡片右键菜单 ====================
+  let _ctxMenuEl = null;
+  function _ctxMenuOutsideHandler(e) {
+    if (!_ctxMenuEl) return;
+    if (e.target && _ctxMenuEl.contains(e.target)) return; // 点菜单内不关
+    closeCardContextMenu();
+  }
+  function _ctxMenuKeyHandler(e) {
+    if (e.key === 'Escape') closeCardContextMenu();
+  }
+  function closeCardContextMenu() {
+    if (_ctxMenuEl) { try { _ctxMenuEl.remove(); } catch {} }
+    _ctxMenuEl = null;
+    document.removeEventListener('mousedown', _ctxMenuOutsideHandler, true);
+    document.removeEventListener('contextmenu', _ctxMenuOutsideHandler, true);
+    document.removeEventListener('keydown', _ctxMenuKeyHandler, true);
+    window.removeEventListener('blur', closeCardContextMenu);
+    window.removeEventListener('resize', closeCardContextMenu);
+    window.removeEventListener('scroll', closeCardContextMenu, true);
+  }
+  function openCardContextMenu(email, x, y) {
+    closeCardContextMenu();
+    const account = accounts.find(a => a.email === email);
+    if (!account) return;
+    const isCur = email === lastEmail;
+    const hasToken = !!(account.password || account.token);
+    const items = [
+      { label: isCur ? '当前账号（不可切换）' : '切换到该账号', disabled: isCur, run: () => { switchingEmail = email; renderCards(); postMsg('switch', { email }); } },
+      { label: '强制切换（忽略锁）', run: () => { switchingEmail = email; renderCards(); postMsg('switch', { email, force: true }); } },
+      { label: '刷新该账号配额', run: () => postMsg('fetchUsageFor', { email }) },
+      { label: account.disabled ? '启用账号' : '禁用账号', run: () => postMsg('toggleDisabled', { email }) },
+      { label: '编辑标签…', run: () => openTagEditModal('edit', email) },
+      { sep: true },
+      { label: '复制邮箱', run: () => copyToClipboardSafe(email, '已复制邮箱：' + displayEmail(email)) },
+      { label: '复制 Token', disabled: !hasToken, run: () => copyToClipboardSafe(account.password || account.token || '', '已复制 Token') },
+      { sep: true },
+      { label: '删除账号', danger: true, run: () => { postMsg('delete', { email }); } },
+    ];
+    const menu = document.createElement('div');
+    menu.className = 'ws-card-ctxmenu';
+    menu.setAttribute('role', 'menu');
+    menu.style.left = '-9999px';
+    menu.style.top = '-9999px';
+    for (const it of items) {
+      if (it.sep) {
+        const sep = document.createElement('div');
+        sep.className = 'ws-ctx-sep';
+        menu.appendChild(sep);
+        continue;
+      }
+      const row = document.createElement('div');
+      row.className = 'ws-ctx-item' + (it.disabled ? ' is-disabled' : '') + (it.danger ? ' is-danger' : '');
+      row.setAttribute('role', 'menuitem');
+      row.textContent = it.label;
+      if (!it.disabled) {
+        row.addEventListener('click', () => {
+          try { it.run(); } catch (e) { console.error(e); }
+          closeCardContextMenu();
+        });
+      }
+      menu.appendChild(row);
+    }
+    document.body.appendChild(menu);
+    // 测量后再定位（防止超出视口）
+    const vw = window.innerWidth; const vh = window.innerHeight;
+    const r = menu.getBoundingClientRect();
+    let left = x;
+    let top = y;
+    if (left + r.width + 4 > vw) left = Math.max(4, vw - r.width - 4);
+    if (top + r.height + 4 > vh) top = Math.max(4, vh - r.height - 4);
+    menu.style.left = left + 'px';
+    menu.style.top = top + 'px';
+    _ctxMenuEl = menu;
+    // 下一帧再注册外部关闭监听，避免本次右键事件立即触发 close
+    setTimeout(() => {
+      document.addEventListener('mousedown', _ctxMenuOutsideHandler, true);
+      document.addEventListener('contextmenu', _ctxMenuOutsideHandler, true);
+      document.addEventListener('keydown', _ctxMenuKeyHandler, true);
+      window.addEventListener('blur', closeCardContextMenu);
+      window.addEventListener('resize', closeCardContextMenu);
+      window.addEventListener('scroll', closeCardContextMenu, true);
+    }, 0);
+  }
+  // ==================== 批量进度条 ====================
+  let _batchProgressHideTimer = null;
+  function updateBatchProgressBar(msg) {
+    const bar = document.getElementById('batchProgress');
+    if (!bar) return;
+    const fill = document.getElementById('batchProgressFill');
+    const lab = document.getElementById('batchProgressLabel');
+    const cnt = document.getElementById('batchProgressCount');
+    const total = Math.max(0, msg.total | 0);
+    const done = Math.max(0, Math.min(total, msg.done | 0));
+    const pct = total > 0 ? Math.floor(done / total * 100) : 0;
+    if (lab) lab.textContent = (msg.label || '处理进度') + (msg.current ? ' · ' + msg.current : '');
+    if (cnt) cnt.textContent = done + '/' + total;
+    if (fill) fill.style.width = pct + '%';
+    bar.hidden = false;
+    bar.classList.toggle('is-done', !!msg.finished && done === total);
+    bar.classList.toggle('is-error', !!msg.error);
+    if (_batchProgressHideTimer) { clearTimeout(_batchProgressHideTimer); _batchProgressHideTimer = null; }
+    if (msg.finished) {
+      _batchProgressHideTimer = setTimeout(() => {
+        bar.hidden = true;
+        bar.classList.remove('is-done', 'is-error');
+        if (fill) fill.style.width = '0%';
+        _batchProgressHideTimer = null;
+      }, 2500);
+    }
+  }
+
+  function copyToClipboardSafe(text, okMsg) {
+    const t = String(text || '');
+    if (!t) { (window.wsToast?.warn || showToast)('无内容可复制', 'warn', 1600); return; }
+    const showOk = () => (window.wsToast?.success || showToast)(okMsg || '已复制', 'success', 1600);
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(t).then(showOk).catch(() => {
+        postMsg('copyText', { text: t });
+        showOk();
+      });
+    } else {
+      postMsg('copyText', { text: t });
+      showOk();
+    }
+  }
+
   // ==================== 事件处理 ====================
   function handleCardAction(e) {
     const target = e.target;
@@ -2907,6 +3087,11 @@
         updateFilterLabel();
         const dropdown = document.getElementById('filterDropdown');
         if (dropdown && !dropdown.hidden) buildFilterDropdown();
+        break;
+      }
+
+      case 'batchProgress': {
+        updateBatchProgressBar(msg);
         break;
       }
 
@@ -4336,17 +4521,28 @@
 
   // ==================== 初始化 ====================
   function init() {
+    // 绑定持久化辅助到 vscode webview state（统一 debounce 写）
+    try { window.wsState?.bind?.(vscode); } catch {}
     // 卡片点击
     if (accountGrid) accountGrid.addEventListener('click', handleCardAction);
-    // 卡片右键：右键标签 chip 时打开"修改标签"模态
+    // 卡片右键：标签 chip 上仍走「修改标签」；其它位置弹出统一上下文菜单
     if (accountGrid) accountGrid.addEventListener('contextmenu', (e) => {
       const chip = e.target.closest('.grid-tag-chip');
-      if (!chip) return;
-      const card = chip.closest('.grid-card');
-      const email = card?.dataset.email;
+      if (chip) {
+        const card = chip.closest('.grid-card');
+        const email = card?.dataset.email;
+        if (email) {
+          e.preventDefault();
+          openTagEditModal('edit', email);
+          return;
+        }
+      }
+      const card = e.target.closest('.grid-card');
+      if (!card) return;
+      const email = card.dataset.email;
       if (!email) return;
       e.preventDefault();
-      openTagEditModal('edit', email);
+      openCardContextMenu(email, e.clientX, e.clientY);
     });
     // 双击标签 chip 修改颜色
     if (accountGrid) accountGrid.addEventListener('dblclick', (e) => {
@@ -4435,6 +4631,35 @@
         const dropdown = document.getElementById('filterDropdown');
         if (dropdown && !dropdown.hidden) buildFilterDropdown();
         renderCards();
+      });
+    }
+    const quickFaultBtn = document.getElementById('quickHealthFaultBtn');
+    const quickFullBtn = document.getElementById('quickQuotaFullBtn');
+    try {
+      const st0 = vscode.getState() || {};
+      if (st0._quickFaultOn) quickFaultOn = true;
+      if (st0._quickFullOn) quickFullOn = true;
+      if (quickFaultBtn) quickFaultBtn.classList.toggle('is-active', quickFaultOn);
+      if (quickFullBtn) quickFullBtn.classList.toggle('is-active', quickFullOn);
+    } catch {}
+    if (quickFaultBtn) {
+      quickFaultBtn.addEventListener('click', () => {
+        quickFaultOn = !quickFaultOn;
+        quickFaultBtn.classList.toggle('is-active', quickFaultOn);
+        try { const st = vscode.getState() || {}; st._quickFaultOn = quickFaultOn; vscode.setState(st); } catch {}
+        currentPage = 1;
+        renderCards();
+        updateFilterLabel();
+      });
+    }
+    if (quickFullBtn) {
+      quickFullBtn.addEventListener('click', () => {
+        quickFullOn = !quickFullOn;
+        quickFullBtn.classList.toggle('is-active', quickFullOn);
+        try { const st = vscode.getState() || {}; st._quickFullOn = quickFullOn; vscode.setState(st); } catch {}
+        currentPage = 1;
+        renderCards();
+        updateFilterLabel();
       });
     }
     updateFilterLabel();

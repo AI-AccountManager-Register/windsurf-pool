@@ -2218,14 +2218,37 @@
 				}
 			}
 		};
-		// 200ms 防抖：AI 边生成边变 DOM，每次都 querySelectorAll 太耗性能
+		// 200ms 防抖 + requestIdleCallback：AI 边生成边变 DOM，每次都 querySelectorAll 太耗性能
+		const scheduleTryClick = () => {
+			if (_autoContinueDebounceTimer) clearTimeout(_autoContinueDebounceTimer);
+			_autoContinueDebounceTimer = setTimeout(() => {
+				if (window.requestIdleCallback) {
+					try { window.requestIdleCallback(tryClick, { timeout: 1500 }); }
+					catch { tryClick(); }
+				} else {
+					tryClick();
+				}
+			}, 200);
+		};
 		autoContinueObserver = new MutationObserver(() => {
 			if (settings.continueMode !== 'smart') return;
-			if (_autoContinueDebounceTimer) clearTimeout(_autoContinueDebounceTimer);
-			_autoContinueDebounceTimer = setTimeout(tryClick, 200);
+			scheduleTryClick();
 		});
-		autoContinueObserver.observe(document.body, { childList: true, subtree: true });
-		console.log(LOG_PREFIX + '[AutoContinue] ✅已启用（防抖 200ms）');
+		// 优先观察 chatRoot（更小范围）；当 chatRoot 暂未出现时再退化到 document.body 并定期升级
+		const _attachObserver = () => {
+			const chatRoot = (typeof findChatRoot === 'function' ? findChatRoot() : null);
+			const root = chatRoot || document.body;
+			try { autoContinueObserver.observe(root, { childList: true, subtree: true }); } catch {}
+			return root === chatRoot;
+		};
+		if (!_attachObserver()) {
+			// 还没找到 chatRoot：每 4s 重新尝试一次升级到 chatRoot
+			const upgradeTimer = setInterval(() => {
+				try { autoContinueObserver.disconnect(); } catch {}
+				if (_attachObserver()) clearInterval(upgradeTimer);
+			}, 4000);
+		}
+		console.log(LOG_PREFIX + '[AutoContinue] ✅已启用（防抖 200ms + idle）');
 	}
 
 	let dismissCorruptObserver = null;
@@ -2250,7 +2273,18 @@
 			if (debounceTimer) clearTimeout(debounceTimer);
 			debounceTimer = setTimeout(tryD, 300);
 		});
-		dismissCorruptObserver.observe(document.body, { childList: true, subtree: true });
+		// 优先观察 notifications-toasts 容器（更小范围），暂未出现时回退 body 并定期升级
+		const attach = () => {
+			const root = document.querySelector('.notifications-toasts') || document.body;
+			try { dismissCorruptObserver.observe(root, { childList: true, subtree: true }); } catch {}
+			return root !== document.body;
+		};
+		if (!attach()) {
+			const upgrade = setInterval(() => {
+				try { dismissCorruptObserver.disconnect(); } catch {}
+				if (attach()) clearInterval(upgrade);
+			}, 5000);
+		}
 		setTimeout(tryD, 2000);
 	}
 
@@ -2278,6 +2312,12 @@
 
 		// ── 配额耗尽 / 速率限制 ──
 		{ pattern: /daily usage quota has been exhausted/i,                    category: 'quotaErrors', signal: 'quota-daily-exhausted' },
+		{ pattern: /your included weekly usage quota is exhausted/i,           category: 'quotaErrors', signal: 'quota-exhausted' },
+		{ pattern: /your included daily usage quota is exhausted/i,            category: 'quotaErrors', signal: 'quota-daily-exhausted' },
+		{ pattern: /your included usage quota is exhausted/i,                  category: 'quotaErrors', signal: 'quota-exhausted' },
+		{ pattern: /included usage quota.*exhausted/i,                         category: 'quotaErrors', signal: 'quota-exhausted' },
+		{ pattern: /purchase extra usage to continue using premium models/i,   category: 'quotaErrors', signal: 'quota-exhausted' },
+		{ pattern: /purchase (?:extra|additional) usage/i,                     category: 'quotaErrors', signal: 'quota-exhausted' },
 		{ pattern: /usage quota.*exhausted/i,                                  category: 'quotaErrors', signal: 'quota-exhausted' },
 		{ pattern: /monthly acu limit reached/i,                              category: 'quotaErrors', signal: 'quota-exhausted' },
 		{ pattern: /you have reached your.*limit/i,                           category: 'quotaErrors', signal: 'quota-exhausted' },
@@ -2915,7 +2955,7 @@
 		// 最终兜底：扫描整个 document.body 查找额度关键词（banner 可能在 chat root 之外）
 		// 注意：必须严格限定在"错误 UI 容器"内，否则会把 AI 聊天消息、代码、文档误判为错误
 		if (!latestError) {
-			const QUOTA_KW_RE = /quota.*exhausted|usage.*limit.*reached|额度.*耗尽|monthly acu limit|rate limit exceeded|upgrade to a Pro|over their global rate limit|reached.*(?:message|rate)\s*limit|速率限制|配额.*(?:用完|耗尽|不足)/i;
+			const QUOTA_KW_RE = /quota.*exhausted|usage.*limit.*reached|额度.*耗尽|monthly acu limit|rate limit exceeded|upgrade to a Pro|over their global rate limit|reached.*(?:message|rate)\s*limit|速率限制|配额.*(?:用完|耗尽|不足)|purchase (?:extra|additional) usage|purchase extra usage to continue/i;
 			// 只在明确的错误 UI 容器内查找（banner/alert/notification/error），避免命中聊天内容
 			const ERROR_CONTAINER_SEL = '[role="alert"],[role="status"],[class*="banner" i],[class*="notification" i],[class*="alert" i],[class*="error" i],[class*="warning" i],[class*="toast" i]';
 			const errorContainers = document.body.querySelectorAll(ERROR_CONTAINER_SEL);
@@ -2936,7 +2976,56 @@
 				break;
 			}
 		}
-		
+
+		// 兜底 C：按"已知配额文案"全文档扫描（绕过容器 class 限制）
+		// 适用：Windsurf 把 quota banner 渲染在没有 alert/banner/error 等关键 class 的容器里时
+		// 命中条件：高置信原文/中文标志短语 + 元素本身可见 + 非聊天/源代码上下文
+		if (!latestError) {
+			const KNOWN_QUOTA_PHRASES = [
+				/your included (?:daily |weekly )?usage quota is exhausted/i,
+				/purchase extra usage to continue using premium models/i,
+				/(?:你|您)的(?:每日|每周)?(?:包含)?用量配额已耗尽/,
+				/购买额外用量以继续使用高级模型/,
+				/已使用\s*\d+%\s*的配额/,
+				/you['\u2019]ve used\s+\d+%\s+of your quota/i,
+			];
+			// 用 TreeWalker 跑一遍可见文本节点，找到第一个命中的元素
+			try {
+				const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+					acceptNode(node) {
+						const t = (node.nodeValue || '').trim();
+						if (t.length < 10 || t.length > 600) return NodeFilter.FILTER_REJECT;
+						return NodeFilter.FILTER_ACCEPT;
+					},
+				});
+				let n;
+				let scanned = 0;
+				while ((n = walker.nextNode()) && scanned < 4000) {
+					scanned++;
+					const t = (n.nodeValue || '').trim();
+					if (!KNOWN_QUOTA_PHRASES.some(re => re.test(t))) continue;
+					const el = n.parentElement;
+					if (!el) continue;
+					if (el.closest(ASSISTANT_MSG_SEL)) continue;
+					if (el.closest(USER_MSG_SEL)) continue;
+					if (el.closest(IGNORED_CONTEXT_SEL)) continue;
+					if (el.closest('#ws-recovery-toast,[id^="ws-"]')) continue;
+					if (el.dataset && el.dataset._wsRecoveryHandled) continue;
+					if (!isVisibleErrorElement(el)) continue;
+					// 取整个 banner 文本（向上找一层包裹）
+					const wrap = el.closest('[class*="purchase" i],[class*="quota" i],[class*="usage" i],[class*="banner" i],[class*="prompt" i]') || el.parentElement || el;
+					const bannerText = (wrap.textContent || '').trim().slice(0, 500);
+					if (isSourceLikeText(bannerText)) continue;
+					latestError = bannerText || t;
+					latestErrorEl = wrap;
+					console.log(LOG_PREFIX + '[getLatestErrorText] 命中已知配额文案 (兜底C): ' + latestError.substring(0, 100));
+					break;
+				}
+			} catch (e) {
+				console.warn(LOG_PREFIX + '[getLatestErrorText] TreeWalker 扫描异常:', e);
+			}
+		}
+
 		return { text: latestError, el: latestErrorEl };
 	}
 
@@ -4254,10 +4343,23 @@
 		});
 		recoveryObserver.observe(document.body, { childList: true, subtree: true });
 
-		// 定时轮询 pool result（兜底）
+		// 定时轮询：除 pool result 外，定期也跑一次 checkForErrors，兜底
+		// "banner 已渲染、DOM 不再变化、observer 不会再触发"的场景（如刷新页面后看到旧 banner）
 		recoveryPollTimer = setInterval(() => {
-			if (settings.autoRecoveryEnabled) checkForPoolResult();
+			if (!settings.autoRecoveryEnabled) return;
+			checkForPoolResult();
+			// grace 期内 / bridge 未就绪 时仅处理 pool result
+			if (Date.now() < _recoveryGraceUntil || !_bridgeReady) return;
+			try { checkForErrors(); } catch (e) { console.warn(LOG_PREFIX + '[Recovery] poll checkForErrors 异常:', e); }
 		}, 3000);
+
+		// grace 期一过立刻触发一次（处理"页面已经显示着 banner 才打开 IDE"的场景）
+		setTimeout(() => {
+			if (!settings.autoRecoveryEnabled) return;
+			if (!_bridgeReady) return;
+			console.log(LOG_PREFIX + '[Recovery] grace 期结束，主动检查一次错误');
+			try { checkForErrors(); } catch (e) { console.warn(LOG_PREFIX + '[Recovery] post-grace checkForErrors 异常:', e); }
+		}, RECOVERY_GRACE_MS + 200);
 
 		console.log(LOG_PREFIX + '[Recovery] ✅自动恢复已启用（' + RECOVERY_GRACE_MS + 'ms 启动冷静期）');
 	}

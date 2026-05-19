@@ -1044,10 +1044,14 @@ class SidebarProvider {
                 (0, usageService_1.setCascadeProbeEnabled)(true);
                 const accounts = await accountStore.readAccounts(this._context);
                 const targets = accounts.filter(a => !a.disabled);
+                let _doneCount = 0;
+                const _totalCount = targets.length;
+                this.postMessage({ type: 'batchProgress', label: '测活进度', done: 0, total: _totalCount, kind: 'health' });
                 for (const acc of targets) {
                     if (hcSignal.aborted)
                         break;
                     this.postMessage({ type: 'testModelResult', email: acc.email, ok: false, reason: '检测中...', testing: true });
+                    this.postMessage({ type: 'batchProgress', label: '测活进度', done: _doneCount, total: _totalCount, current: acc.email, kind: 'health' });
                     try {
                         const result = await (0, usageService_1.testModelAccess)(acc, model, hcSignal);
                         if (hcSignal.aborted)
@@ -1064,11 +1068,14 @@ class SidebarProvider {
                         this.postMessage({ type: 'testModelResult', email: acc.email, ok: false, reason, ts: Date.now() });
                         this._recordDiagnostic(acc.email, 'health', false, reason, model?.label || model?.uid || 'Claude Sonnet 4.6');
                     }
+                    _doneCount++;
+                    this.postMessage({ type: 'batchProgress', label: '测活进度', done: _doneCount, total: _totalCount, kind: 'health' });
                 }
                 this._healthCheckAbort = undefined;
                 (0, usageService_1.setCascadeProbeEnabled)(false);
                 (0, cascadeProbe_1.stopIsolatedCascadeProbeLs)();
                 (0, acpRecovery_1.scheduleAcpConnectionRecovery)('sidebar-health-check-done', 1500);
+                this.postMessage({ type: 'batchProgress', label: '测活完成', done: _doneCount, total: _totalCount, finished: true, kind: 'health' });
                 this.postMessage({ type: 'testModelAllDone' });
                 break;
             }
@@ -1199,6 +1206,13 @@ class SidebarProvider {
                 const email = String(message.email || '').trim();
                 if (email) {
                     await vscode.env.clipboard.writeText(email);
+                }
+                break;
+            }
+            case 'copyText': {
+                const text = String(message.text || '');
+                if (text) {
+                    await vscode.env.clipboard.writeText(text);
                 }
                 break;
             }
@@ -1965,6 +1979,9 @@ class SidebarProvider {
         const extVersion = vscode.extensions.getExtension('local.windsurf-pool')?.packageJSON?.version || '0.0.0';
         const cssUri = `${webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'resources', 'webview', 'main.css'))}?v=${extVersion}`;
         const jsUri = `${webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'resources', 'webview', 'main.js'))}?v=${extVersion}`;
+        const toastUri = `${webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'resources', 'webview', 'lib', 'toast.js'))}?v=${extVersion}`;
+        const stateUri = `${webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'resources', 'webview', 'lib', 'state.js'))}?v=${extVersion}`;
+        const templateUri = `${webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'resources', 'webview', 'lib', 'template.js'))}?v=${extVersion}`;
         return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -3008,6 +3025,8 @@ class SidebarProvider {
           </svg>
         </button>
         <button class="quick-health-filter-btn" id="quickHealthOkBtn" title="只显示测活结果为可用的账号">可用</button>
+        <button class="quick-health-filter-btn" id="quickHealthFaultBtn" title="只显示有错误/不可用的账号">故障</button>
+        <button class="quick-health-filter-btn" id="quickQuotaFullBtn" title="只显示日剩余≥80%且周剩余≥80%的账号">满额</button>
         <div style="flex:1"></div>
         <span class="toolbar-pager" id="toolbarPager" hidden></span>
         <select class="page-size-select" id="pageSizeSelect" title="每页显示">
@@ -3035,6 +3054,14 @@ class SidebarProvider {
         <button class="batch-action-btn" id="batchDisableBtn" title="禁用选中账号">禁用</button>
         <button class="batch-action-btn batch-action-delete" id="batchDeleteBtn" title="删除选中账号">删除</button>
         <button class="batch-action-btn" id="batchCancelBtn">取消</button>
+      </div>
+      <!-- 批量操作进度条 -->
+      <div class="batch-progress" id="batchProgress" hidden>
+        <div class="batch-progress-info">
+          <span class="batch-progress-label" id="batchProgressLabel">处理中</span>
+          <span class="batch-progress-count" id="batchProgressCount">0/0</span>
+        </div>
+        <div class="batch-progress-track"><div class="batch-progress-fill" id="batchProgressFill"></div></div>
       </div>
         <div id="accountGrid" class="account-grid"></div>
         <div id="emptyState" class="empty-card">
@@ -3286,6 +3313,9 @@ devin-session-token$eyJhbGciOiJIUzI1NiIs...</pre>
   <script>const vscode = acquireVsCodeApi();</script>
   <script>${(0, signalBridge_1.getSignalBridgeScript)()}</script>
   <script>${(0, signalBridge_1.getBridgeRelayScript)()}</script>
+  <script src="${toastUri}"></script>
+  <script src="${stateUri}"></script>
+  <script src="${templateUri}"></script>
   <script src="${jsUri}"></script>
 </body>
 </html>`;

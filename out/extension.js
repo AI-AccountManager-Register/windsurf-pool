@@ -54,6 +54,7 @@ const accountLock_1 = require("./accountLock");
 const utils_1 = require("./utils");
 const elevatedFs_1 = require("./elevatedFs");
 const usageTracker_1 = require("./usageTracker");
+const logger = require("./util/logger");
 const logPanelProvider_1 = require("./logPanelProvider");
 const healthCheckPanel_1 = require("./healthCheckPanel");
 const cascadeProbe_1 = require("./cascadeProbe");
@@ -64,6 +65,11 @@ let autoSwitcher;
 let statusBar;
 let usageTracker;
 function activate(context) {
+    // 统一日志通道（其他模块用 logger.get('xxx') 即可写入）
+    const logChannel = vscode.window.createOutputChannel('Windsurf 号池 · 日志');
+    context.subscriptions.push(logChannel);
+    logger.setOutputChannel(logChannel);
+    logger.get('boot').info('extension activated, version=' + (context.extension?.packageJSON?.version || '?'));
     (0, cascadeProbe_1.setExtensionPath)(context.extensionPath);
     (0, acpRecovery_1.scheduleAcpAgentRepair)('extension-activate', 10000);
     (0, acpRecovery_1.scheduleAcpConnectionRecovery)('extension-activate', 12000);
@@ -95,7 +101,7 @@ function activate(context) {
     context.subscriptions.push(autoSwitcher);
     autoSwitcher.start();
     // 底部状态栏（独立于侧栏面板，启动即显示）
-    statusBar = new statusBar_1.StatusBarManager(context, autoSwitcher);
+    statusBar = new statusBar_1.StatusBarManager(context, autoSwitcher, usageTracker);
     context.subscriptions.push(statusBar);
     statusBar.update();
     // 跨窗口账号锁：初始化并锁定当前账号
@@ -108,6 +114,8 @@ function activate(context) {
     (0, updater_1.autoCheckOnStartup)();
     // macOS/Linux: 检测安装目录是否可写，不可写则提示一次
     checkInstallPermission(context);
+    // 首次安装欢迎引导（仅展示一次）
+    maybeShowWelcome(context).catch((e) => logger.get('welcome').warn('show failed', e));
     // 创建侧栏提供器
     sidebarProvider = new sidebarProvider_1.SidebarProvider(context.extensionUri, context, autoSwitcher, usageTracker);
     // 侧栏手动切号成功后立即更新状态栏
@@ -225,6 +233,74 @@ function activate(context) {
         }
     });
     context.subscriptions.push(switchNextCmd);
+    // ── 快速切换面板（QuickPick 富信息）──
+    const quickSwitchCmd = vscode.commands.registerCommand('windsurfPool.quickSwitch', async () => {
+        const accounts = await accountStore.readAccounts(context);
+        const enabled = accounts.filter((a) => !a.disabled);
+        if (enabled.length === 0) {
+            vscode.window.showInformationMessage('暂无可用账号，请先添加');
+            return;
+        }
+        const curEmail = context.globalState.get('lastEmail') || '';
+        const cache = autoSwitcher.getAllCached?.() || new Map();
+        const stats = usageTracker?.getStats?.();
+        const planRank = (n) => {
+            const x = (n || '').toLowerCase();
+            if (x.includes('enterprise')) return 0;
+            if (x.includes('team')) return 1;
+            if (x.includes('pro')) return 2;
+            if (x.includes('trial')) return 3;
+            if (x.includes('free')) return 4;
+            return 5;
+        };
+        const items = enabled.map((a) => {
+            const entry = cache.get?.(a.email);
+            const snap = entry?.snapshot;
+            const tags = Array.isArray(a.tags) ? a.tags : (a.tag ? [a.tag] : []);
+            const pct = snap ? Math.min(snap.dailyRemainingPercent, snap.weeklyRemainingPercent) : -1;
+            const today = stats?.accounts?.[a.email]?.switchToCount || 0;
+            const planTxt = snap?.planName || '未加载';
+            const tagTxt = tags.length ? ` · ${tags.join(',')}` : '';
+            const detail = snap
+                ? `日剩 ${Math.round(snap.dailyRemainingPercent)}% · 周剩 ${Math.round(snap.weeklyRemainingPercent)}% · 今日切 ${today} 次`
+                : `_未加载额度_ · 今日切 ${today} 次`;
+            const cur = a.email === curEmail ? '$(check) ' : '';
+            return {
+                label: `${cur}${a.email}`,
+                description: `${planTxt}${tagTxt}`,
+                detail,
+                _email: a.email,
+                _pct: pct,
+                _planRank: planRank(planTxt),
+                _current: a.email === curEmail,
+            };
+        });
+        items.sort((x, y) => {
+            if (x._current !== y._current) return x._current ? -1 : 1;
+            if (x._planRank !== y._planRank) return x._planRank - y._planRank;
+            return (y._pct || -1) - (x._pct || -1);
+        });
+        const picked = await vscode.window.showQuickPick(items, {
+            placeHolder: '输入邮箱/标签/计划进行筛选，回车切换',
+            matchOnDescription: true,
+            matchOnDetail: true,
+        });
+        if (!picked || picked._current) return;
+        const account = enabled.find((a) => a.email === picked._email);
+        if (!account) return;
+        const { injectSession } = await Promise.resolve().then(() => __importStar(require('./sessionInjector')));
+        const success = await injectSession(context, account);
+        if (success) {
+            await accountStore.setCurrentAccount(context, account.email);
+            vscode.window.showInformationMessage('已切换至 ' + account.email);
+            sidebarProvider?.refresh?.();
+            statusBar?.update?.();
+        } else {
+            const failure = (0, sessionInjector_1.getLastInjectFailure)(account.email);
+            vscode.window.showErrorMessage('切换失败：' + (failure?.reason || '未知原因'));
+        }
+    });
+    context.subscriptions.push(quickSwitchCmd);
     const removeAccountCmd = vscode.commands.registerCommand('windsurfPool.removeAccount', async () => {
         const accounts = await accountStore.readAccounts(context);
         if (accounts.length === 0) {
@@ -600,6 +676,39 @@ function autoFixChecksums() {
         console.warn('[windsurf-pool] checksum fix exception:', err);
     }
 }
+/**
+ * 首次安装欢迎引导：仅出现一次，引导启用增强 / 添加账号 / 打开侧栏
+ */
+async function maybeShowWelcome(context) {
+    const KEY = 'windsurfPool.welcomeShown.v1';
+    if (context.globalState.get(KEY)) return;
+    // 延迟 1.5s 让侧栏/状态栏先渲染，避免一打开就盖住主界面
+    await new Promise((r) => setTimeout(r, 1500));
+    const sel = await vscode.window.showInformationMessage(
+        '👋 欢迎使用 Windsurf 号池管理！\n建议先完成 3 步：① 启用增强（汉化+无感切号）  ② 添加账号  ③ 设置自动切号',
+        { modal: false },
+        '启用增强',
+        '添加账号',
+        '打开侧栏',
+        '不再提示',
+    );
+    try {
+        if (sel === '启用增强') {
+            await vscode.workspace.getConfiguration('windsurfPool.enhancement').update('enabled', true, vscode.ConfigurationTarget.Global);
+            await vscode.commands.executeCommand('windsurfPool.reinjectEnhancement');
+            vscode.window.showInformationMessage('增强已启用，下次重启 Windsurf 后生效');
+        } else if (sel === '添加账号') {
+            await vscode.commands.executeCommand('windsurfPool.addAccount');
+        } else if (sel === '打开侧栏') {
+            await vscode.commands.executeCommand('windsurfPool.openSidebar');
+        }
+    } catch (e) {
+        logger.get('welcome').warn('action failed', e);
+    } finally {
+        if (sel) context.globalState.update(KEY, true);
+    }
+}
+
 async function deactivate() {
     try {
         (0, accountLock_1.stopHeartbeat)();
