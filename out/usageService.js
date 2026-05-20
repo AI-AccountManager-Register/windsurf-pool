@@ -107,19 +107,19 @@ function parseRateLimitBody(body) {
         return {
             ok: false,
             reason: reset
-                ? `${isModelLimit ? '当前模型额度/频率限制' : '账号消息额度/频率限制'}，约 ${reset} 后恢复${resetEta}`
+                ? `${isModelLimit ? 'Windsurf 官方模型额度限制' : 'Windsurf 官方消息频率限制'}，约 ${reset} 后恢复${resetEta}`
                 : isModelLimit
-                    ? `当前模型额度已达上限${upgradeHint ? '，可换模型或等待刷新' : ''}（服务端未返回恢复时间）`
-                    : '消息额度/频率限制（服务端未返回恢复时间）',
+                    ? `Windsurf 官方模型额度已达上限${upgradeHint ? '，可换模型或等待刷新' : ''}（服务端未返回恢复时间）`
+                    : 'Windsurf 官方消息频率限制（服务端未返回恢复时间）',
             remaining: 0,
         };
     }
     if (d.hasCapacity === false) {
-        return { ok: false, reason: '消息已用尽', remaining: 0 };
+        return { ok: false, reason: 'Windsurf 官方消息额度已用尽', remaining: 0 };
     }
     if (typeof d.messagesRemaining === 'number') {
         if (d.messagesRemaining === 0)
-            return { ok: false, reason: '剩余 0 条', remaining: 0 };
+            return { ok: false, reason: 'Windsurf 官方消息额度剩余 0 条', remaining: 0 };
         return { ok: true, remaining: d.messagesRemaining };
     }
     return { ok: true, remaining: null };
@@ -131,10 +131,10 @@ function formatProbeLimitReason(tag, planName, probe) {
     const label = kind === 'overall'
         ? (hasReset ? '官方临时限流' : '官方全局限制/长期不可用')
         : kind === 'model'
-            ? '当前模型限流'
+            ? 'Windsurf 官方模型限流'
             : kind === 'message'
-                ? '消息限流'
-                : '频率限制';
+                ? 'Windsurf 官方消息限流'
+                : 'Windsurf 官方频率限制';
     const parts = [`${tag}${label} [${plan}]`];
     if (kind === 'overall') {
         parts.push('overall message rate limit');
@@ -468,6 +468,15 @@ async function fetchUsage(account, options = {}) {
         const period = shouldFetchPeriod
             ? await fetchPlanPeriod(account)
             : { start: options.previousSnapshot?.planStart, end: options.previousSnapshot?.planEnd };
+        // overageBalanceMicros 可能是字符串或数字，统一转换；优先取 topUpStatus（更准），回退 planStatus
+        const parseBalance = (v) => {
+            if (typeof v === 'number')
+                return v;
+            if (typeof v === 'string')
+                return parseInt(v, 10) || 0;
+            return 0;
+        };
+        const overageBalanceMicros = parseBalance(period.overageBalanceMicros) || parseBalance(ps.overageBalanceMicros);
         const snapshot = {
             name: account.name || account.email.split('@')[0],
             email: account.email,
@@ -477,7 +486,7 @@ async function fetchUsage(account, options = {}) {
             dailyResetAtUnix: parseInt(String(ps.dailyQuotaResetAtUnix)) || 0,
             weeklyResetAtUnix: parseInt(String(ps.weeklyQuotaResetAtUnix)) || 0,
             flexCredits: parseInt(String(ps.availableFlexCredits)) || 0,
-            overageBalanceMicros: typeof ps.overageBalanceMicros === 'number' ? ps.overageBalanceMicros : 0,
+            overageBalanceMicros,
             planStart: period.start,
             planEnd: period.end,
             _rawPlanStatus: ps
@@ -504,9 +513,13 @@ async function fetchPlanPeriod(account) {
         }
         const data = JSON.parse(res.body);
         const ps = data?.planStatus || data;
+        // topUpStatus 包含额外余额信息
+        const topUp = data?.topUpStatus || {};
         return {
             start: ps.planStart,
-            end: ps.planEnd
+            end: ps.planEnd,
+            // 优先从 topUpStatus 获取，其次从 planStatus 获取
+            overageBalanceMicros: topUp.overageBalanceMicros ?? topUp.balanceMicros ?? ps.overageBalanceMicros
         };
     }
     catch {

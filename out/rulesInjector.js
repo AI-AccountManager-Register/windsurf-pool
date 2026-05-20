@@ -174,7 +174,7 @@ function removeScriptDisciplineRules() {
  * 启用增强时：确保所有增强相关规则都已注入（缺什么补什么）
  */
 function ensureAllEnhancementRules() {
-    const enabled = vscode.workspace.getConfiguration('windsurfPool.enhancement').get('enabled', true);
+    const enabled = vscode.workspace.getConfiguration('windsurfPool.enhancement').get('enabled', false);
     if (!enabled)
         return;
     if (!hasBubbleRules()) {

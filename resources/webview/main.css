@@ -1026,6 +1026,26 @@ details > summary::marker { display: none; content: ''; }
     border-color: var(--accent);
     color: var(--accent-fg);
 }
+.balance-filter-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 0 8px 0 6px;
+}
+.balance-filter-btn .balance-filter-count {
+    font-size: 10px;
+    font-weight: 500;
+    color: inherit;
+    opacity: 0.75;
+}
+.balance-filter-btn.is-active {
+    background: rgba(212, 175, 55, 0.18);
+    border-color: rgba(212, 175, 55, 0.6);
+    color: #d4af37;
+}
+.balance-filter-btn.is-active .balance-filter-count {
+    opacity: 1;
+}
 
 .group-select-mode-btn {
     padding: 3px 10px;

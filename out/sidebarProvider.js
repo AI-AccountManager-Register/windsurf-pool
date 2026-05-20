@@ -643,6 +643,14 @@ class SidebarProvider {
                 this.refreshBridgeInfo();
             }
         });
+        // 监听 VSCode 配置变更：用户在设置面板改 enhancement.enabled / autoRecovery 时实时同步到 sidebar UI
+        const cfgSub = vscode.workspace.onDidChangeConfiguration((e) => {
+            if (e.affectsConfiguration('windsurfPool.enhancement.enabled') ||
+                e.affectsConfiguration('windsurfPool.enhancement.autoRecovery')) {
+                this._pushEnhancementStatus();
+            }
+        });
+        this._disposables.push(cfgSub);
         // 监听 webview 消息
         webviewView.webview.onDidReceiveMessage(async (message) => {
             await this.handleMessage(message);
@@ -674,7 +682,7 @@ class SidebarProvider {
     _pushEnhancementStatus() {
         try {
             const status = (0, enhancementInjector_1.getInjectionStatus)();
-            const enabled = vscode.workspace.getConfiguration('windsurfPool.enhancement').get('enabled', true);
+            const enabled = vscode.workspace.getConfiguration('windsurfPool.enhancement').get('enabled', false);
             const autoRecovery = vscode.workspace.getConfiguration('windsurfPool.enhancement').get('autoRecovery', true);
             const ext = vscode.extensions.getExtension('local.windsurf-pool');
             const extVersion = ext?.packageJSON?.version || '0.0.0';
@@ -855,7 +863,7 @@ class SidebarProvider {
                 if (isForce) {
                     this.log(`[switch][trigger] 强制切号(跨窗口抢占): → ${email}`);
                 }
-                const success = await (0, sessionInjector_1.injectSession)(this._context, account);
+                const success = await (0, sessionInjector_1.injectSession)(this._context, account, { force: isForce });
                 if (success) {
                     this.postMessage({ type: 'switchResult', email, ok: true });
                     this._recordDiagnostic(email, 'switch', true, '切换成功');
@@ -1296,7 +1304,7 @@ class SidebarProvider {
                 break;
             }
             case 'toggleEnhancement': {
-                const current = vscode.workspace.getConfiguration('windsurfPool.enhancement').get('enabled', true);
+                const current = vscode.workspace.getConfiguration('windsurfPool.enhancement').get('enabled', false);
                 const next = !current;
                 await vscode.workspace.getConfiguration('windsurfPool.enhancement').update('enabled', next, vscode.ConfigurationTarget.Global);
                 // 真正启用/关闭：操作文件而非仅改配置
@@ -3027,6 +3035,7 @@ class SidebarProvider {
         <button class="quick-health-filter-btn" id="quickHealthOkBtn" title="只显示测活结果为可用的账号">可用</button>
         <button class="quick-health-filter-btn" id="quickHealthFaultBtn" title="只显示有错误/不可用的账号">故障</button>
         <button class="quick-health-filter-btn" id="quickQuotaFullBtn" title="只显示日剩余≥80%且周剩余≥80%的账号">满额</button>
+        <button class="quick-health-filter-btn balance-filter-btn" id="balanceFilterBtn" title="只显示有额外余额的账号">💰<span class="balance-filter-count" id="balanceFilterCount">(0)</span></button>
         <div style="flex:1"></div>
         <span class="toolbar-pager" id="toolbarPager" hidden></span>
         <select class="page-size-select" id="pageSizeSelect" title="每页显示">

@@ -305,6 +305,7 @@
   let filterTags = new Set();    // 标签
   let filterStatuses = new Set(); // 状态
   let filterHealth = new Set();  // 测活结果
+  let filterBalance = false;     // 工具栏「有余额」过滤 (overageBalanceMicros > 0)
   let quickFaultOn = false;       // 顶部「故障」快速过滤
   let quickFullOn = false;        // 顶部「满额」快速过滤
 
@@ -375,6 +376,10 @@
     }
     if (filterStatuses.size > 0 && !filterStatuses.has(getAccountStatus(account))) return false;
     if (filterHealth.size > 0 && !filterHealth.has(getHealthStatus(account.email))) return false;
+    if (filterBalance) {
+      const snap = usageCache.get(account.email)?.snapshot;
+      if (!snap || !(snap.overageBalanceMicros > 0)) return false;
+    }
     if (quickFaultOn) {
       const hs = getHealthStatus(account.email);
       if (hs === '可用' || hs === '未检测') return false;
@@ -450,7 +455,7 @@
     const labelEl = document.getElementById('filterLabel');
     const countEl = document.getElementById('filterCount');
     if (!labelEl || !countEl) return;
-    const totalFilters = filterPlans.size + filterTags.size + filterStatuses.size + filterHealth.size;
+    const totalFilters = filterPlans.size + filterTags.size + filterStatuses.size + filterHealth.size + (filterBalance ? 1 : 0);
     if (totalFilters === 0) {
       labelEl.textContent = 'ALL';
       countEl.textContent = '(' + accounts.length + ')';
@@ -461,6 +466,20 @@
     }
     const quickHealthOkBtn = document.getElementById('quickHealthOkBtn');
     if (quickHealthOkBtn) quickHealthOkBtn.classList.toggle('is-active', filterHealth.has('可用'));
+    updateBalanceFilterBtn();
+  }
+
+  // 更新工具栏「有余额」按钮状态 (计数 + 高亮)
+  function updateBalanceFilterBtn() {
+    const btn = document.getElementById('balanceFilterBtn');
+    const countEl = document.getElementById('balanceFilterCount');
+    if (!btn) return;
+    const balanceCount = accounts.filter(a => {
+      const snap = usageCache.get(a.email)?.snapshot;
+      return snap && snap.overageBalanceMicros && snap.overageBalanceMicros > 0;
+    }).length;
+    if (countEl) countEl.textContent = '(' + balanceCount + ')';
+    btn.classList.toggle('is-active', filterBalance);
   }
 
   function getAccountGroup(account) {
@@ -997,7 +1016,7 @@
       if (accountGrid) accountGrid.classList.remove('no-card-anim');
     });
 
-    const hasFilter = searchQuery.trim() || activeTagFilters.length > 0 || activeTagFilter || filterPlans.size > 0 || filterTags.size > 0 || filterStatuses.size > 0 || filterHealth.size > 0;
+    const hasFilter = searchQuery.trim() || activeTagFilters.length > 0 || activeTagFilter || filterPlans.size > 0 || filterTags.size > 0 || filterStatuses.size > 0 || filterHealth.size > 0 || filterBalance;
     if (gridCount) gridCount.textContent = hasFilter ? filtered.length + ' / ' + accounts.length + ' 个' : accounts.length + ' 个';
     if (emptyState) emptyState.hidden = accounts.length > 0;
     if (accountGrid) accountGrid.hidden = accounts.length === 0;
@@ -1204,10 +1223,10 @@
       return resetMatch ? `官方临时限流，${resetMatch[1].trim()} 后再试` : '官方临时限流，稍后再试';
     }
     if (/消息.*额度|消息.*限制|模型额度|额度.*上限|已达上限|用尽|频率|限流|限速|rate limit|quota.*exhaust|usage.*quota|daily.*quota|overall|reset/i.test(text)) {
-      if (minuteMatch) return `消息/频率限制，约 ${minuteMatch[1]} 分钟后恢复`;
+      if (minuteMatch) return `Windsurf 官方频率限制，约 ${minuteMatch[1]} 分钟后恢复`;
       const secondMatch = text.match(/(\d+)\s*s/i) || text.match(/(\d+)\s*秒/);
-      if (secondMatch) return `消息/频率限制，约 ${secondMatch[1]} 秒后恢复`;
-      return '账号消息/频率限制，稍后恢复';
+      if (secondMatch) return `Windsurf 官方频率限制，约 ${secondMatch[1]} 秒后恢复`;
+      return 'Windsurf 官方频率限制，稍后恢复';
     }
     if (/探针失败|probe.*fail|probe.*error|probe:/i.test(text)) return '探针检测异常';
     if (/NO_ACCESS|无权限|不支持|unsupported|not.*support/i.test(text)) return '当前模型无权限';
@@ -2851,13 +2870,14 @@
     lastEmail = newLastEmail;
     externalAccount = newExternalAccount || '';
     // 自动清除无效过滤器：如果过滤器激活但 0 条匹配，清掉过时状态
-    const totalFilters = filterPlans.size + filterTags.size + filterStatuses.size + filterHealth.size;
+    const totalFilters = filterPlans.size + filterTags.size + filterStatuses.size + filterHealth.size + (filterBalance ? 1 : 0);
     if (totalFilters > 0 && accounts.length > 0 && accounts.filter(a => passesFilter(a)).length === 0) {
       filterPlans.clear();
       filterTags.clear();
       filterStatuses.clear();
       filterHealth.clear();
-      try { const st = vscode.getState() || {}; st._filterPlans = []; st._filterTags = []; st._filterStatuses = []; st._filterHealth = []; vscode.setState(st); } catch {}
+      filterBalance = false;
+      try { const st = vscode.getState() || {}; st._filterPlans = []; st._filterTags = []; st._filterStatuses = []; st._filterHealth = []; st._filterBalance = false; vscode.setState(st); } catch {}
     }
     renderCards();
     // 账号数据到达后重新渲染标签选择器（修复时序问题：settingsSync 先到，accounts 后到时标签列表为空）
@@ -4568,6 +4588,7 @@
       if (st._filterTags) filterTags = new Set(st._filterTags);
       if (st._filterStatuses) filterStatuses = new Set(st._filterStatuses);
       if (st._filterHealth) filterHealth = new Set(st._filterHealth);
+      if (typeof st._filterBalance === 'boolean') filterBalance = st._filterBalance;
     } catch {}
     function persistFilters() {
       const st = vscode.getState() || {};
@@ -4575,6 +4596,7 @@
       st._filterTags = [...filterTags];
       st._filterStatuses = [...filterStatuses];
       st._filterHealth = [...filterHealth];
+      st._filterBalance = filterBalance;
       vscode.setState(st);
     }
     if (filterTrigger && filterDropdown) {
@@ -4616,9 +4638,24 @@
         filterTags.clear();
         filterStatuses.clear();
         filterHealth.clear();
+        filterBalance = false;
         persistFilters();
         currentPage = 1;
         buildFilterDropdown();
+        renderCards();
+      });
+    }
+    // 「有余额」过滤按钮
+    const balanceFilterBtn = document.getElementById('balanceFilterBtn');
+    if (balanceFilterBtn) {
+      updateBalanceFilterBtn();
+      balanceFilterBtn.addEventListener('click', () => {
+        filterBalance = !filterBalance;
+        persistFilters();
+        currentPage = 1;
+        updateBalanceFilterBtn();
+        const dropdown = document.getElementById('filterDropdown');
+        if (dropdown && !dropdown.hidden) buildFilterDropdown();
         renderCards();
       });
     }

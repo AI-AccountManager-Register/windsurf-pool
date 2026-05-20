@@ -20,6 +20,7 @@
   let searchQuery = '';
   let activeTag = ''; // '' = 全部
   let activeStatus = 'all';
+  let activePlan = ''; // '' = 全部套餐
 
   // ── Elements ──
   const startBtn = document.getElementById('hcStartBtn');
@@ -231,6 +232,39 @@
     });
   }
 
+  // 按套餐筛选下拉
+  function buildPlanFilter() {
+    var sel = document.getElementById('hcPlanFilter');
+    if (!sel) return;
+    var plans = {};
+    accountList.forEach(function (a) {
+      if (a.disabled) return;
+      var p = a.plan || '';
+      if (!p) return;
+      plans[p] = (plans[p] || 0) + 1;
+    });
+    var keys = Object.keys(plans).sort();
+    var prev = activePlan;
+    var html = '<option value="">全部套餐 (' + accountList.filter(function (a) { return !a.disabled; }).length + ')</option>';
+    keys.forEach(function (k) {
+      html += '<option value="' + escHtml(k) + '"' + (k === prev ? ' selected' : '') + '>' + escHtml(k) + ' (' + plans[k] + ')</option>';
+    });
+    sel.innerHTML = html;
+    // 已选套餐若不在新数据中（账号被删/套餐变化），重置为全部
+    if (prev && !plans[prev]) {
+      activePlan = '';
+      sel.value = '';
+    }
+    if (!sel._wsBound) {
+      sel._wsBound = true;
+      sel.addEventListener('change', function () {
+        activePlan = this.value || '';
+        renderTable();
+        updateRetestBtn();
+      });
+    }
+  }
+
   function filterAccounts(list, options) {
     var ignoreResultStatus = options && options.ignoreResultStatus;
     return list.filter(function (a) {
@@ -240,6 +274,7 @@
         if (at.indexOf(activeTag) === -1) return false;
       }
       if (searchQuery && a.email.toLowerCase().indexOf(searchQuery) === -1) return false;
+      if (activePlan && (a.plan || '') !== activePlan) return false;
       if (!ignoreResultStatus && activeStatus !== 'all') {
         var r = results.get(a.email);
         var bucket = getResultBucket(r);
@@ -778,6 +813,7 @@
           }
         });
         buildTagChips();
+        buildPlanFilter();
         renderTable();
         updateStats();
         break;

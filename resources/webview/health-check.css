@@ -551,6 +551,20 @@ body.vscode-light .hc-detail-tip {
   transition: border-color 0.2s;
 }
 .hc-search-input:focus { border-color: var(--hc-accent); }
+.hc-plan-filter {
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--hc-border);
+  border-radius: var(--hc-radius);
+  background: var(--hc-surface);
+  color: var(--hc-fg);
+  font-size: 12px;
+  outline: none;
+  cursor: pointer;
+  max-width: 220px;
+  transition: border-color 0.2s;
+}
+.hc-plan-filter:focus, .hc-plan-filter:hover { border-color: var(--hc-accent); }
 .hc-status-tabs {
   display: inline-flex;
   align-items: center;

@@ -578,7 +578,7 @@ class AutoSwitcher {
                 return;
             console.log(`[autoSwitch][trigger] 执行切号: ${curEmail} → ${verified.email} (score=${Math.round(verified.score)})`);
             const { injectSession } = await Promise.resolve().then(() => __importStar(require('./sessionInjector')));
-            const ok = await injectSession(this._ctx, acct, { silent: true });
+            const ok = await injectSession(this._ctx, acct, { silent: true, auto: true });
             if (ok) {
                 // 切换成功后才设置 cooldown（失败则立即可重试）
                 this._cooldownUntil = Date.now() + s.cooldownSec * 1000;
@@ -665,7 +665,7 @@ class AutoSwitcher {
             if (!acct)
                 return null;
             const { injectSession } = await Promise.resolve().then(() => __importStar(require('./sessionInjector')));
-            const ok = await injectSession(this._ctx, acct, { silent: true });
+            const ok = await injectSession(this._ctx, acct, { silent: true, auto: true });
             if (!ok)
                 return null;
             (0, healthCheckPanel_1.clearHealthResult)(cand.email);

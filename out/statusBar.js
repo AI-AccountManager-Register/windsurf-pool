@@ -59,6 +59,7 @@ const DEFAULTS = {
     showAutoSwitch: true,
     showInstance: true,
     showSwitches: true,
+    showBalance: true,
 };
 const VALID_STYLES = ['dot', 'percent', 'compact', 'dual', 'labeled', 'full'];
 const VALID_POSITIONS = ['left', 'right'];
@@ -136,6 +137,7 @@ class StatusBarManager {
                 showAutoSwitch: sb.showAutoSwitch !== false,
                 showInstance: sb.showInstance !== false,
                 showSwitches: sb.showSwitches !== false,
+                showBalance: sb.showBalance !== false,
             };
         }
         catch {
@@ -223,7 +225,12 @@ class StatusBarManager {
         }
         // ── 渲染主体（按 style 分发）──
         const body = this._renderBodyByStyle(cfg.style, dot, snap, curEmail);
-        this._left.text = `$(account) ${prefix}${body}`;
+        // ── 额外余额后缀 ──
+        let balanceSuffix = '';
+        if (cfg.showBalance && snap && typeof snap.overageBalanceMicros === 'number' && snap.overageBalanceMicros > 0) {
+            balanceSuffix = ` 💰$${(snap.overageBalanceMicros / 1000000).toFixed(2)}`;
+        }
+        this._left.text = `$(account) ${prefix}${body}${balanceSuffix}`;
         this._left.tooltip = this._buildLeftTooltip(curEmail, entry);
         this._left.show();
     }
@@ -275,6 +282,8 @@ class StatusBarManager {
         md.appendMarkdown(`- **周剩余**：${Math.round(snap.weeklyRemainingPercent)}%\n`);
         if (snap.flexCredits > 0)
             md.appendMarkdown(`- **Flex Credits**：${snap.flexCredits}\n`);
+        if (typeof snap.overageBalanceMicros === 'number' && snap.overageBalanceMicros > 0)
+            md.appendMarkdown(`- **额外余额**：$${(snap.overageBalanceMicros / 1000000).toFixed(2)}\n`);
         if (snap.dailyResetAtUnix)
             md.appendMarkdown(`- **日重置**：${formatResetTime(snap.dailyResetAtUnix)}\n`);
         if (snap.weeklyResetAtUnix)

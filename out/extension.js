@@ -532,7 +532,7 @@ function activate(context) {
     // [Windsurf 增强] 重新注入命令
     const reinjectCmd = vscode.commands.registerCommand('windsurfPool.reinjectEnhancement', async () => {
         // 增强开关被用户关闭时，ensureEnhancement 会直接 return 且无 error，友好提示而非报"未知错误"
-        const enabled = vscode.workspace.getConfiguration('windsurfPool.enhancement').get('enabled', true);
+        const enabled = vscode.workspace.getConfiguration('windsurfPool.enhancement').get('enabled', false);
         if (!enabled) {
             const action = await vscode.window.showWarningMessage('Windsurf 增强已关闭，无法注入。是否立即启用？', '立即启用', '取消');
             if (action === '立即启用') {
@@ -600,7 +600,7 @@ async function autoSwitchByBindMark(context) {
         }
         console.log(`[autoSwitch][trigger] autoSwitchByBindMark: 执行切号 → ${targetEmail}`);
         const { injectSession } = await Promise.resolve().then(() => __importStar(require('./sessionInjector')));
-        const success = await injectSession(context, account, { silent: true });
+        const success = await injectSession(context, account, { silent: true, auto: true });
         if (success) {
             console.log(`[autoSwitch][trigger] autoSwitchByBindMark: 切号成功 → ${targetEmail}`);
             await accountStore.setCurrentAccount(context, targetEmail);

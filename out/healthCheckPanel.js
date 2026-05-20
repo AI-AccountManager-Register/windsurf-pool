@@ -50,6 +50,7 @@ const acpRecovery_1 = require("./acpRecovery");
 const utils_1 = require("./utils");
 const sessionInjector_1 = require("./sessionInjector");
 const accountLock_1 = require("./accountLock");
+const usageDiskCache = __importStar(require("./usageDiskCache"));
 let _panel;
 let _abortController;
 let _paused = false;
@@ -324,13 +325,19 @@ async function pushAccounts(ctx) {
     if (!_panel)
         return;
     const accounts = await accountStore.readAccounts(ctx);
-    const list = accounts.map(a => ({
-        email: a.email,
-        disabled: !!a.disabled,
-        tag: a.tag || '',
-        tags: a.tags || (a.tag ? [a.tag] : []),
-        cached: _resultCache.get(a.email) || null,
-    }));
+    const usageEntries = usageDiskCache.loadAll();
+    const list = accounts.map(a => {
+        const ue = usageEntries.get(a.email);
+        const plan = ue?.snapshot?.planName || '';
+        return {
+            email: a.email,
+            disabled: !!a.disabled,
+            tag: a.tag || '',
+            tags: a.tags || (a.tag ? [a.tag] : []),
+            plan,
+            cached: _resultCache.get(a.email) || null,
+        };
+    });
     _panel.webview.postMessage({ type: 'accounts', list });
     _panel.webview.postMessage({ type: 'tagColors', colors: _tagColors });
 }
@@ -754,6 +761,9 @@ function buildHtml(cssUri, jsUri, version) {
       <span class="hc-status-tab" data-status="pending">待检测</span>
     </div>
     <button class="hc-btn hc-btn-sm hc-btn-retest" id="hcRetestBtn" hidden title="对当前筛选的账号进行二次测试">重测此类</button>
+    <select class="hc-plan-filter" id="hcPlanFilter" title="按套餐筛选">
+      <option value="">全部套餐</option>
+    </select>
     <div class="hc-tag-chips" id="hcTagChips"></div>
   </div>
 
