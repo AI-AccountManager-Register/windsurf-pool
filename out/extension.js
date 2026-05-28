@@ -47,6 +47,7 @@ const usageDiskCache_1 = require("./usageDiskCache");
 const statusBar_1 = require("./statusBar");
 const updater_1 = require("./updater");
 const enhancementInjector_1 = require("./enhancementInjector");
+const enhSettingsStore_1 = require("./enhSettingsStore");
 const rulesInjector_1 = require("./rulesInjector");
 const checksumFixer_1 = require("./checksumFixer");
 const bridgeServer_1 = require("./bridgeServer");
@@ -360,6 +361,21 @@ function activate(context) {
         }).catch(err => {
             console.warn('[windsurf-pool] bridge server failed to start:', err);
         });
+    }
+    // [v7.8.9 升级重置] 每次版本升级都强制将 continueMode 重置为 'simple'
+    // 必须在 ensureEnhancement() 之前执行，确保注入到 workbench.html 的设置已是重置后状态
+    try {
+        const currentVersion = context.extension?.packageJSON?.version || '0.0.0';
+        const m = (0, enhSettingsStore_1.resetContinueModeOnUpgrade)(currentVersion);
+        if (m.changed) {
+            console.log(`[windsurf-pool] reset continueMode on upgrade ${m.lastVersion ?? '(none)'} → ${currentVersion}: ${m.from} → simple`);
+        }
+        else if (m.lastVersion !== currentVersion) {
+            console.log(`[windsurf-pool] continueMode reset skipped (current=${m.from}) on upgrade ${m.lastVersion ?? '(none)'} → ${currentVersion}`);
+        }
+    }
+    catch (err) {
+        console.warn('[windsurf-pool] resetContinueModeOnUpgrade failed:', err);
     }
     // [Windsurf 增强] 自动注入 DOM 增强脚本到 workbench.html
     try {

@@ -38,6 +38,7 @@ exports.readAccountsSync = readAccountsSync;
 exports.readAccounts = readAccounts;
 exports.saveAccounts = saveAccounts;
 exports.upsertAccount = upsertAccount;
+exports.stripEmailEntrySuffix = stripEmailEntrySuffix;
 exports.removeAccount = removeAccount;
 exports.batchRemove = batchRemove;
 exports.updateTag = updateTag;
@@ -233,6 +234,13 @@ async function upsertAccount(context, account) {
         }
         await saveAccounts(context, accounts);
     });
+}
+/**
+ * 把 `email#oauth` 形式的内部 key 还原为原始邮箱（用于注入到 Windsurf 等场景）。
+ */
+function stripEmailEntrySuffix(email) {
+    const i = email.indexOf('#');
+    return i > 0 ? email.slice(0, i) : email;
 }
 /**
  * 删除账号

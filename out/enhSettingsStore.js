@@ -37,6 +37,7 @@ exports.getEnhSettingsPath = getEnhSettingsPath;
 exports.readEnhSettings = readEnhSettings;
 exports.writeEnhSettings = writeEnhSettings;
 exports.mergeEnhSettings = mergeEnhSettings;
+exports.resetContinueModeOnUpgrade = resetContinueModeOnUpgrade;
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const utils_1 = require("./utils");
@@ -106,5 +107,39 @@ function mergeEnhSettings(patch) {
     const updated = { ...current, ...patch };
     writeEnhSettings(updated);
     return updated;
+}
+/**
+ * 升级重置：每次版本号变化时强制将 continueMode 重置为 'simple'。
+ *
+ * 规则：
+ *   - `continueMode === 'smart'`     → 强制 → `'simple'`
+ *   - `continueMode === undefined`   → 强制 → `'simple'`
+ *   - `continueMode === 'brainless'` → 不动（避免打断长任务）
+ *   - `continueMode === 'simple'`    → 不动（已是新默认）
+ *   - `continueMode === 'off'`       → 不动（尊重用户禁用）
+ *
+ * 调用时机：扩展激活时、ensureEnhancement() 之前。
+ */
+function resetContinueModeOnUpgrade(currentVersion) {
+    const settings = readEnhSettings();
+    const lastVersion = settings.__defaultsAppliedAt;
+    // 同版本启动 → 跳过
+    if (lastVersion === currentVersion)
+        return { changed: false, lastVersion };
+    const from = settings.continueMode;
+    let changed = false;
+    if (from === undefined || from === 'smart') {
+        settings.continueMode = 'simple';
+        settings.autoContinueTab = 'simple';
+        changed = true;
+    }
+    // brainless / simple / off 保持不变
+    settings.__defaultsAppliedAt = currentVersion;
+    // 清理旧的一次性标记
+    if ('__migratedToSimpleV779' in settings) {
+        delete settings.__migratedToSimpleV779;
+    }
+    writeEnhSettings(settings);
+    return { changed, from, lastVersion };
 }
 //# sourceMappingURL=enhSettingsStore.js.map

@@ -51,8 +51,12 @@
 		// 汉化设置
 		localizationEnabled: true,
 		// 自动操作
-		continueMode: 'smart',  // 'smart' | 'brainless' | 'off'
-		continueText: 'continue',  // 自动发送的文本（两种模式共享）
+		continueMode: 'simple',  // 'simple' | 'smart' | 'brainless' | 'off'（默认 simple = 错误图标触发）
+		continueText: 'continue',  // 自动发送的文本（所有模式共享）
+		// simple 模式：检测红三角错误图标自动发 continue（参考 auto-continue 思路）
+		// smart 模式：检测 Cascade 显示的 Continue 按钮自动点击
+		// brainless 模式：长任务队列模式
+		simpleContinueCooldownMs: 8000,
 		dismissCorruptEnabled: true,
 		autoSwitchEnabled: true,
 		autoSwitchOnQuota: true,
@@ -72,8 +76,9 @@
 		recoveryConfirmEnabled: true,        // 总开关：所有自动恢复操作都先弹 banner 倒计时
 		recoveryCountdownSeconds: 5,         // 倒计时秒数（3-15）
 		// 分类恢复规则
+		// v7.6.30: 精简策略 — 大部分错误发“继续”就够，只有真正配额耗尽才切号
 		recoveryRules: {
-			networkErrors:      { action: 'retry', maxRetries: 3, delay: 3000 },
+			networkErrors:      { action: 'send-continue' },  // 临时限流/网络错误 → 发继续
 			quotaErrors:        { action: 'switch-account', afterAction: 'auto' },
 			// modelErrors 默认从 switch-model 改为 send-continue：
 			// 实测"模型提供商不可达"等第三方故障是临时性的，等几秒发继续就能恢复，
@@ -88,7 +93,7 @@
 		notifyEnabled: true,
 		notifyTrigger: 'always',    // always | error | idle
 		notifySound: true,
-		notifyDesktop: true,
+		notifyDesktop: false,
 		notifyTone: 'funk',         // funk | ding | chime | beep
 		notifyRepeat: 2,            // 1-5
 	};
@@ -107,6 +112,15 @@
 				if (merged.brainlessModeEnabled) merged.continueMode = 'brainless';
 				else if (merged.autoContinueEnabled === false) merged.continueMode = 'off';
 				else merged.continueMode = 'smart';
+			}
+			// 防御性兜底：扩展宿主侧 resetContinueModeOnUpgrade 已经按版本号触发重置；
+			// 这里仅在 injected 缺失（极端情况）且 localStorage 残留 smart 时再做一次兜底。
+			if (injected && injected.__defaultsAppliedAt) {
+				// extension 已重置过，merged.continueMode 反映的是最新版本下的有效设置
+			} else if (merged.continueMode === undefined || merged.continueMode === 'smart') {
+				// 仅在没有版本号信号时兜底
+				merged.continueMode = 'simple';
+				merged.autoContinueTab = 'simple';
 			}
 			return merged;
 		} catch {
@@ -456,9 +470,34 @@
 	
 	function submitBubbleText(text) {
 		if (!text) return;
+		// v7.8.3: 提前短路 — bubbles 已关掉时根本不该写入输入框
+		if (!settings.bubblesEnabled) {
+			console.log(LOG_PREFIX + '[Bubbles] submitBubbleText 短路: bubblesEnabled=false');
+			return;
+		}
+		// v7.8.3: 抽取清空残留 helper（与 sendContinueMessage 的 before-trySend 一致）
+		const _cleanupBubbleResidual = (stage) => {
+			const cleanupEl = findInputEl();
+			if (cleanupEl) {
+				try { cleanupEl.focus(); document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); } catch {}
+			}
+			console.log(LOG_PREFIX + '[Bubbles] ' + stage + ' 短路: bubbles 已关闭，已清空输入框残留');
+		};
 		setInputText(text).then(ok => {
-			if (!ok || !settings.bubblesAutoSend) return;
-			setTimeout(() => trySendMessage(), 400);
+			if (!ok) return;
+			// v7.8.3: setInputText 完成后立即检查 — bubbles 总开关或 autoSend 关掉时清残留
+			if (!settings.bubblesEnabled || !settings.bubblesAutoSend) {
+				_cleanupBubbleResidual('post-setInput');
+				return;
+			}
+			// v7.8.2: setTimeout 400ms 内用户可能关掉 bubblesEnabled / bubblesAutoSend，闭包内独立短路
+			setTimeout(() => {
+				if (!settings.bubblesEnabled || !settings.bubblesAutoSend) {
+					_cleanupBubbleResidual('setTimeout');
+					return;
+				}
+				trySendMessage();
+			}, 400);
 		});
 	}
 	
@@ -2756,6 +2795,9 @@
 	let _lastErrorFingerprint = '';
 	let _lastSwitchFingerprint = '';  // 上次触发切号的错误指纹
 	let _lastSwitchTs = 0;
+	// v7.7.4: 防死循环计数器 — 连续 balance-skip 后强制切号
+	let _balanceSkipCount = 0;
+	let _lastBalanceSkipTs = 0;
 	let _recoveryCooldownMs = 10000;  // 默认 10s，切号后临时拉长到 30s
 
 	// 生成错误指纹（去除时间戳/数字，仅保留语义）
@@ -3127,6 +3169,40 @@
 						recordRecoveryLog({ category: 'B', error: '', action: 'switch-cancel', result: 'user-cancelled' });
 					},
 				});
+			} else if (result.type === 'balance-available') {
+				// v7.7.4: 余额号保护 — 有付费余额时不切号，自动发继续
+				// 防死循环：60s 内连续 3 次 balance-skip → 强制切号（缓存可能不准）
+				const now = Date.now();
+				if (now - _lastBalanceSkipTs < 60000) {
+					_balanceSkipCount++;
+				} else {
+					_balanceSkipCount = 1;
+				}
+				_lastBalanceSkipTs = now;
+
+				if (_balanceSkipCount >= 3) {
+					console.log(LOG_PREFIX + '[Recovery] 连续 3 次 balance-skip，疑似缓存不准，强制切号');
+					showRecoveryNotification('余额保护触发过频，强制切号...');
+					_balanceSkipCount = 0;
+					recordRecoveryLog({ category: 'B', error: '', action: 'balance-skip', result: 'force-switch' });
+					localStorage.removeItem('ws-pool-result');
+					localStorage.removeItem('ws-pool-signal');
+					// 发 force=true 强制切号（绕过余额保护）
+					sendPoolSignal('quota-exhausted', { force: true });
+					return;
+				}
+
+				console.log(LOG_PREFIX + '[Recovery] 当前账号有付费余额，跳过切号，自动发继续 (' + _balanceSkipCount + '/3)');
+				showRecoveryNotification('当前账号有付费余额，继续使用');
+				_recoveryCooldownMs = 10000;
+				recordRecoveryLog({ category: 'B', error: '', action: 'balance-skip', result: 'send-continue' });
+				localStorage.removeItem('ws-pool-result');
+				localStorage.removeItem('ws-pool-signal');
+				// 自动发继续
+				setTimeout(() => {
+					if (!settings.autoRecoveryEnabled) return;
+					handleSendContinueAction('余额号跳过切号', Date.now(), 'quotaErrors');
+				}, 1000);
 			} else if (result.type === 'switch-failed') {
 				console.log(LOG_PREFIX + '[Recovery] 切号失败: ' + (result.error || ''));
 				showRecoveryNotification(result.error || '切换失败，所有账号可能均无额度');
@@ -3251,6 +3327,102 @@
 		// 自动隐藏（4s）
 		clearTimeout(toast._hideTimer);
 		toast._hideTimer = setTimeout(hideToast, 4000);
+	}
+
+	// v7.8.5: 专用 bridge 未就绪 toast（带「关闭自动切号」按钮，绕过 bridge 直接改本端 settings）
+	// 不自动消失，必须用户主动点按钮 —— 这是死锁的应急出口
+	function showBridgeNotReadyToast() {
+		try { sessionStorage.setItem('ws-bridge-warn-shown', '1'); } catch {}
+		try { document.getElementById('ws-bridge-warn-toast')?.remove(); } catch {}
+		const toast = document.createElement('div');
+		toast.id = 'ws-bridge-warn-toast';
+		toast.style.cssText = [
+			'position:fixed', 'top:80px', 'right:20px',
+			'max-width:420px', 'min-width:280px',
+			'background:rgba(30,30,36,0.96)',
+			'backdrop-filter:blur(16px) saturate(1.4)',
+			'-webkit-backdrop-filter:blur(16px) saturate(1.4)',
+			'color:#e6edf3', 'padding:0',
+			'border-radius:12px',
+			'font-size:12.5px', 'font-weight:500', 'line-height:1.45',
+			'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Inter",sans-serif',
+			'z-index:2147483647',
+			'border:1px solid rgba(245,158,11,0.25)',
+			'box-shadow:0 8px 32px rgba(0,0,0,0.55),0 2px 8px rgba(0,0,0,0.3),inset 0 1px 0 rgba(255,255,255,0.04)',
+			'transition:opacity 0.3s cubic-bezier(0.4,0,0.2,1),transform 0.3s cubic-bezier(0.4,0,0.2,1)',
+			'pointer-events:auto', 'overflow:hidden',
+			'opacity:0', 'transform:translateX(16px) scale(0.96)',
+		].join(';');
+		setSafeHTML(toast,
+			'<div style="display:flex;align-items:stretch">'
+			+ '<div style="width:3px;background:#f59e0b;flex-shrink:0;border-radius:12px 0 0 12px"></div>'
+			+ '<div style="padding:12px 14px;flex:1;min-width:0">'
+			+   '<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">'
+			+     '<div style="width:26px;height:26px;border-radius:7px;background:rgba(245,158,11,0.12);display:flex;align-items:center;justify-content:center;flex-shrink:0"><span style="font-size:13px">⚠️</span></div>'
+			+     '<span style="color:#e2e8f0;font-size:12.5px;font-weight:600">自动切号未激活</span>'
+			+   '</div>'
+			+   '<div style="color:#94a3b8;font-size:11.5px;line-height:1.5;margin-bottom:10px">'
+			+     '号池侧栏未打开，bridge 通道未就绪。<br/>'
+			+     '— 打开侧栏即可激活；<br/>'
+			+     '— 或永久关闭自动切号。'
+			+   '</div>'
+			+   '<div style="display:flex;gap:8px;justify-content:flex-end">'
+			+     '<button id="ws-bw-disable" style="background:rgba(245,158,11,0.15);color:#fbbf24;border:1px solid rgba(245,158,11,0.3);padding:5px 10px;border-radius:6px;font-size:11.5px;cursor:pointer;font-weight:500">关闭自动切号</button>'
+			+     '<button id="ws-bw-ack" style="background:rgba(148,163,184,0.12);color:#cbd5e1;border:1px solid rgba(148,163,184,0.2);padding:5px 10px;border-radius:6px;font-size:11.5px;cursor:pointer;font-weight:500">我知道了</button>'
+			+   '</div>'
+			+ '</div>'
+			+ '</div>');
+		document.body.appendChild(toast);
+		requestAnimationFrame(() => {
+			toast.style.opacity = '1';
+			toast.style.transform = 'translateX(0) scale(1)';
+		});
+		function hide() {
+			toast.style.opacity = '0';
+			toast.style.transform = 'translateX(16px) scale(0.96)';
+			setTimeout(() => { try { toast.remove(); } catch {} }, 350);
+		}
+		const disableBtn = toast.querySelector('#ws-bw-disable');
+		const ackBtn = toast.querySelector('#ws-bw-ack');
+		if (disableBtn) disableBtn.onclick = function() {
+			settings.autoSwitchEnabled = false;
+			try { saveSettings(settings); } catch {}
+			// v7.8.5: 入待同步队列 + 立即尝试 flush，确保下次启动 Windsurf 也是关闭状态
+			try { enqueuePendingEnhPatch({ autoSwitchEnabled: false }); flushPendingEnhPatch(); } catch {}
+			console.log(LOG_PREFIX + '[Recovery] 用户从 toast 关闭了自动切号（绕过 bridge）');
+			hide();
+			showRecoveryNotification('已关闭自动切号 ✓ 已持久化', 'success');
+		};
+		if (ackBtn) ackBtn.onclick = hide;
+	}
+
+	// v7.8.5: 待同步设置队列（同 origin localStorage 可写，跨进程不丢）
+	const PENDING_ENH_KEY = 'ws-pending-enh-patch';
+	function enqueuePendingEnhPatch(patch) {
+		try {
+			const raw = localStorage.getItem(PENDING_ENH_KEY);
+			const queue = raw ? JSON.parse(raw) : {};
+			Object.assign(queue, patch);
+			localStorage.setItem(PENDING_ENH_KEY, JSON.stringify(queue));
+		} catch {}
+	}
+	function flushPendingEnhPatch() {
+		try {
+			const raw = localStorage.getItem(PENDING_ENH_KEY);
+			if (!raw) return;
+			const patch = JSON.parse(raw);
+			if (!patch || !Object.keys(patch).length) return;
+			// 尝试通过 bridge 推送（bridge 就绪时才会成功）
+			const base = getBridgeUrl();
+			if (!base || !_bridgeReady) return;
+			fetch(base + '/merge-settings', {
+				method: 'POST',
+				headers: { ...getBridgeHeaders(), 'Content-Type': 'application/json' },
+				body: JSON.stringify(patch),
+			}).then(r => {
+				if (r.ok) localStorage.removeItem(PENDING_ENH_KEY);
+			}).catch(() => {});
+		} catch {}
 	}
 
 	// ========== 恢复日志 ==========
@@ -4032,59 +4204,118 @@
 
 	// ── 统一发送 continue 辅助函数（防重复 + 按钮提交） ──
 	// 注意：test-send-continue 不走这里（直接调 setInputText/trySendMessage 以绕过总开关）
-	async function sendContinueMessage(customText) {
-		// 总开关：关闭自动继续时，任何路径都不发送（切号后、工具上限、无脑模式、守护面板均生效）
+	// v7.8.2: 统一短路 helper —— 模块级变量 settings 始终是最新值（applySettingsChange 会 Object.assign）
+	// v7.8.4: 增加 expectedMode 参数 — 调用方传入后，模式变化（如 brainless→simple）同样短路
+	let _sendingContinue = false;
+	function _shouldAbortContinueSend(stage, expectedMode) {
 		if (settings.continueMode === 'off') {
-			console.log(LOG_PREFIX + '[trigger] sendContinueMessage 被拦截: 自动继续已关闭 (continueMode=off)');
+			console.warn(LOG_PREFIX + '[sendContinue] in-flight 短路 @ ' + stage + '：continueMode 已变 off');
+			return true;
+		}
+		if (expectedMode && settings.continueMode !== expectedMode) {
+			console.warn(LOG_PREFIX + '[sendContinue] in-flight 短路 @ ' + stage + '：mode 从 ' + expectedMode + ' 切换到 ' + settings.continueMode);
+			return true;
+		}
+		return false;
+	}
+	async function sendContinueMessage(customText, expectedMode) {
+		// #2: continueMode=off 配置矛盾 → 弹 toast 提醒（60s 节流防 spam）
+		if (settings.continueMode === 'off') {
+			const now = Date.now();
+			if (now - _continueModeOffWarnedTs > 60000) {
+				_continueModeOffWarnedTs = now;
+				console.warn(LOG_PREFIX + '[sendContinue] continueMode=off，跳过发送（请在自动继续面板开启总开关）');
+				try { showRecoveryNotification('自动继续已禁用 → 请在「自动继续」面板开启总开关', 'error'); } catch {}
+			}
+			return false;
+		}
+		if (_sendingContinue) {
+			console.log(LOG_PREFIX + '[sendContinue] 已有发送在进行中，跳过');
 			return false;
 		}
 		const cooldown = (settings.sendCooldown && settings.sendCooldown > 0) ? settings.sendCooldown : 10000;
-		if (Date.now() - _lastContinueTs < cooldown) return false;
+		if (Date.now() - _lastContinueTs < cooldown) {
+			console.log(LOG_PREFIX + '[sendContinue] cooldown 中，剩余 ' + Math.round((cooldown - (Date.now() - _lastContinueTs)) / 1000) + 's');
+			return false;
+		}
 		const text = customText || (settings.continueText && String(settings.continueText).trim()) || 'continue';
 
+		_sendingContinue = true;
+		try {
 		// v6.6.1 关键修复：已有 queued 消息时，不再写入新文本+点按钮
 		// 直接派发 Enter 触发 Windsurf 自己处理队列。
-		// 用户反馈场景：配额耗尽 + 1 条"继续"已 queued + 输入框残留"继续" → 死锁
-		// Windsurf DOM 上已经明示「按回车发送排队消息 (⏎)」，Enter 是官方推荐路径。
 		if (hasQueuedMessage()) {
 			const inputEl = findInputEl();
-			if (inputEl) {
-				dispatchEnterKey(inputEl);
-				_lastContinueTs = Date.now();
-				console.log(LOG_PREFIX, '[sendContinue] ✅ 已有 queued 消息 → 直接 Enter 触发队列（不重复入队）');
-				bumpAcStat('sendMsg');
-				// 等 Windsurf 处理一下队列
-				await new Promise(r => setTimeout(r, 1500));
-				return true;
+			if (!inputEl) {
+				console.warn(LOG_PREFIX + '[sendContinue] queued 路径找不到输入框');
+				return false;
 			}
+			dispatchEnterKey(inputEl);
+			// #5 修复：轮询验证 queued 是否真的消失（5×600ms = 3s 验证窗口）
+			for (let i = 0; i < 5; i++) {
+				await new Promise(r => setTimeout(r, 600));
+				// v7.8.2: 每轮 await 后短路 — 用户在此期间关闭总开关时立即中断
+				// v7.8.4: 同样验证 expectedMode（brainless→simple 等切换）
+				if (_shouldAbortContinueSend('queued-verify#' + (i + 1), expectedMode)) return false;
+				if (!hasQueuedMessage()) {
+					_lastContinueTs = Date.now();
+					bumpAcStat('sendMsg');
+					console.log(LOG_PREFIX + '[sendContinue] ✅ Enter (queued) - 第 ' + (i + 1) + ' 轮验证通过');
+					return true;
+				}
+			}
+			// 验证失败：queued 仍存在，Enter 没生效。不占 cooldown 允许重试
+			console.warn(LOG_PREFIX + '[sendContinue] ⚠ Enter 触发后 queued 仍存在（dispatchEnterKey 可能失效）');
+			return false;
 		}
 
 		if (!await setInputText(text)) return false;
+		// v7.8.2: setInputText 完成后检查总开关
+		if (_shouldAbortContinueSend('post-setInput', expectedMode)) {
+			try { const c = findInputEl(); if (c) { c.focus(); document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); } } catch {}
+			return false;
+		}
 		_lastContinueTs = Date.now();
 		markActionClick();
 		// 等 Lexical 状态稳定后尝试发送
 		await new Promise(r => setTimeout(r, 400));
+		// v7.8.3: setTimeout 400ms 内用户可能关掉开关，再次检查
+		if (_shouldAbortContinueSend('pre-trySend', expectedMode)) {
+			try { const c = findInputEl(); if (c) { c.focus(); document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); } } catch {}
+			return false;
+		}
 		const method = trySendMessage();
 		console.log(LOG_PREFIX, '[sendContinue] 尝试发送:', method);
-		// 验证：等 1.5s 检查输入框是否被清空（真正发送成功 Windsurf 会自动清空输入框）
-		await new Promise(r => setTimeout(r, 1500));
-		const el = findInputEl();
-		const remaining = (el?.textContent || '').trim();
-		if (remaining.length > 0) {
-			// v6.6.0 Bug C 修复：输入框残留可能是 queued 状态（消息已成功入队），不是真实失败
-			// queued 状态下扩展不应清空输入框，否则会把 Windsurf 入队的消息抹掉
+		// 验证：轮询 5×600ms 检查输入框是否被清空
+		for (let i = 0; i < 5; i++) {
+			await new Promise(r => setTimeout(r, 600));
+			// v7.8.2: 每轮循环开始时检查总开关 + 子开关
+			if (_shouldAbortContinueSend('send-verify#' + (i + 1), expectedMode)) return false;
+			const el = findInputEl();
+			const remaining = (el?.textContent || '').trim();
+			if (remaining.length === 0) {
+				console.log(LOG_PREFIX, '[sendContinue] ✅ 发送成功（输入框已清空，第' + (i + 1) + '轮）');
+				bumpAcStat('sendMsg');
+				return true;
+			}
 			if (hasQueuedMessage()) {
 				console.log(LOG_PREFIX, '[sendContinue] ✅ 发送成功（消息已入队，不清空残留）');
 				bumpAcStat('sendMsg');
 				return true;
 			}
+		}
+		// 5 轮后仍有残留，清空
+		const el = findInputEl();
+		const remaining = (el?.textContent || '').trim();
+		if (remaining.length > 0) {
 			console.log(LOG_PREFIX, '[sendContinue] ⚠ 发送未生效（输入框仍有"' + remaining.substring(0, 20) + '"），清空残留');
 			try { if (el) { el.focus(); document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); } } catch {}
 			return false;
 		}
-		console.log(LOG_PREFIX, '[sendContinue] ✅ 发送成功（输入框已清空）');
-		bumpAcStat('sendMsg');
 		return true;
+		} finally {
+			_sendingContinue = false;
+		}
 	}
 
 	// v6.6.2 终极修订（第四轮审查）：检测 Windsurf 是否处于 queued 状态
@@ -4161,6 +4392,7 @@
 	}
 
 	let _lastContinueTs = 0;
+	let _continueModeOffWarnedTs = 0;
 	function checkForContinuePrompts() {
 		if (settings.continueMode !== 'smart') return;
 		// 守护面板「突破限制」开关关闭时不自动发送 continue
@@ -4297,8 +4529,24 @@
 	// 另外还要等 bridge 真正就绪（_bridgeReady），否则恢复时无法切号会显示"没连上插件"
 	let _recoveryGraceUntil = 0;
 	let _bridgeReady = false;
+	// v7.8.5: 记录 bridge 失联时间，给 brainless mode 提供 stale 判定（连续失联超过阈值自动暂停长任务）
+	let _bridgeUnreadySince = 0;
 	let _recoveryEverStarted = false; // 是否曾经启动过（grace 只在首次启动时计算）
+	let _bridgeWarnTs = 0;
+	const _wsInitTs = Date.now();
 	const RECOVERY_GRACE_MS = 8000;
+
+	// v7.8.5: bridge 未就绪时主动提醒（避免静默失效）
+	// 仅在「本会话首次扫到错误时」弹一次，sessionStorage 标记
+	function _maybeWarnBridgeNotReady() {
+		if (settings.autoSwitchEnabled === false) return;
+		const now = Date.now();
+		if (now - _wsInitTs < 45000) return;
+		try { if (sessionStorage.getItem('ws-bridge-warn-shown') === '1') return; } catch {}
+		_bridgeWarnTs = now;
+		console.warn(LOG_PREFIX + '[Recovery] ⚠ bridge 未就绪，请打开 Windsurf 号池侧栏激活');
+		showBridgeNotReadyToast();
+	}
 
 	function startAutoRecovery() {
 		if (recoveryObserver) { recoveryObserver.disconnect(); recoveryObserver = null; }
@@ -4349,7 +4597,10 @@
 			if (!settings.autoRecoveryEnabled) return;
 			checkForPoolResult();
 			// grace 期内 / bridge 未就绪 时仅处理 pool result
-			if (Date.now() < _recoveryGraceUntil || !_bridgeReady) return;
+			if (Date.now() < _recoveryGraceUntil || !_bridgeReady) {
+				if (!_bridgeReady) _maybeWarnBridgeNotReady();
+				return;
+			}
 			try { checkForErrors(); } catch (e) { console.warn(LOG_PREFIX + '[Recovery] poll checkForErrors 异常:', e); }
 		}, 3000);
 
@@ -4723,6 +4974,14 @@
 		_brainlessLastChangeTs = Date.now();
 		brainlessTimer = setInterval(() => {
 			if (settings.continueMode !== 'brainless') return;
+			// v7.8.5: Bridge 失联 30s+ 自动暂停长任务（防止用户失联仍狂消耗 quota）
+			//   场景：扩展崩溃 / Windsurf 后台进程死掉 / 端口异常 → 用户没法点「强制停止」
+			//   策略：补丁端自我保护，本地停 brainlessTimer + 切回 simple 模式
+			if (_bridgeUnreadySince > 0 && Date.now() - _bridgeUnreadySince > 30000) {
+				console.warn(LOG_PREFIX + '[Brainless] ⚠ Bridge 已失联 ' + Math.round((Date.now() - _bridgeUnreadySince) / 1000) + 's，自动暂停长任务（安全保护）');
+				stopBrainlessMode('Bridge 失联 30s，自动暂停（请重新打开侧栏后继续）');
+				return;
+			}
 			// AI 正在生成 → 重置计时器
 			if (isAIGenerating()) {
 				_brainlessLastChangeTs = Date.now();
@@ -4974,6 +5233,7 @@
 				_bridgePollFailStreak++;
 				if (_bridgePollFailStreak >= 3 && _bridgeReady) {
 					_bridgeReady = false;
+					_bridgeUnreadySince = _bridgeUnreadySince || Date.now();
 					console.warn(LOG_PREFIX + '[bridge] 连续 3 次响应非 200，标记为未就绪');
 				}
 				return [];
@@ -4981,6 +5241,7 @@
 			_bridgePollFailStreak = 0;
 			if (!_bridgeReady) {
 				_bridgeReady = true;
+				_bridgeUnreadySince = 0;
 				console.log(LOG_PREFIX + '[bridge] 心跳恢复，重新标记为就绪');
 			}
 			return await res.json();
@@ -4988,6 +5249,7 @@
 			_bridgePollFailStreak++;
 			if (_bridgePollFailStreak >= 3 && _bridgeReady) {
 				_bridgeReady = false;
+				_bridgeUnreadySince = _bridgeUnreadySince || Date.now();
 				console.warn(LOG_PREFIX + '[bridge] 连续 3 次连接失败，标记为未就绪');
 			}
 			return [];

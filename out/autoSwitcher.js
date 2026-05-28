@@ -45,6 +45,7 @@ const healthCheckPanel_1 = require("./healthCheckPanel");
 const DEFAULTS = {
     enabled: true,
     threshold: 15,
+    preheatMargin: 10, // 预热边距：当前分数 <= 25% 时开始预热
     checkSec: 5,
     cooldownSec: 15,
     scoreMode: 'min',
@@ -57,11 +58,13 @@ const DEFAULTS = {
     preferUsedThreshold: 50,
     poolScope: 'all',
     poolTags: [],
+    minBalanceToSkipSwitch: 100000, // $0.10
 };
 const THROTTLE_MS = 2000;
 const ERROR_BACKOFF_MS = 5000;
 // CURRENT_TTL_MS 不再硬编码，跟随 checkSec 设置（见 _checkAndSwitch）
 const ANTI_BOUNCE_MS = 5 * 60000;
+const PREHEAT_VALID_MS = 5 * 60000; // 预热账号有效期 5 分钟
 // ─── AutoSwitcher ───────────────────────────────────────
 class AutoSwitcher {
     constructor(ctx, tracker) {
@@ -75,6 +78,10 @@ class AutoSwitcher {
         this._cooldownUntil = 0;
         this._lastSwitchedFrom = '';
         this._lastSwitchedAt = 0;
+        // 预热状态
+        this._preheatedEmail = null;
+        this._preheatedAt = 0;
+        this._preheating = false;
         this._onUsageUpdate = null;
         this._onSwitchEvent = null;
         this._onRefreshUI = null;
@@ -93,6 +100,7 @@ class AutoSwitcher {
         return {
             enabled: this._ctx.globalState.get('as.enabled', DEFAULTS.enabled),
             threshold: this._ctx.globalState.get('as.threshold', DEFAULTS.threshold),
+            preheatMargin: this._ctx.globalState.get('as.preheatMargin', DEFAULTS.preheatMargin),
             checkSec: this._ctx.globalState.get('as.checkSec', DEFAULTS.checkSec),
             cooldownSec: this._ctx.globalState.get('as.cooldownSec', DEFAULTS.cooldownSec),
             refreshMin: this._ctx.globalState.get('as.refreshMin', DEFAULTS.refreshMin),
@@ -112,6 +120,8 @@ class AutoSwitcher {
             await this._ctx.globalState.update('as.enabled', p.enabled);
         if (p.threshold !== undefined)
             await this._ctx.globalState.update('as.threshold', p.threshold);
+        if (p.preheatMargin !== undefined)
+            await this._ctx.globalState.update('as.preheatMargin', p.preheatMargin);
         if (p.checkSec !== undefined)
             await this._ctx.globalState.update('as.checkSec', p.checkSec);
         if (p.cooldownSec !== undefined)
@@ -410,6 +420,13 @@ class AutoSwitcher {
             this._inflight.delete(acct.email);
         }
     }
+    // ── 内部：余额是否足够（统一判断）──
+    // v7.7.4: 所有"是否有可用余额"判断都走此方法，确保策略一致
+    _hasUsableBalance(snap) {
+        const balance = snap?.overageBalanceMicros || 0;
+        const minBalance = this.settings.minBalanceToSkipSwitch ?? 100000; // 默认 $0.10
+        return balance >= minBalance;
+    }
     // ── 内部：跳过判断 ──
     _shouldSkip(email) {
         const e = this._cache.get(email);
@@ -440,6 +457,58 @@ class AutoSwitcher {
             }
         }
         catch { /* ignore */ }
+    }
+    // ── 内部：预热下一个候选账号 ──
+    async _triggerPreheat(curEmail, s) {
+        // 已有有效预热账号则跳过
+        if (this._preheatedEmail && Date.now() - this._preheatedAt < PREHEAT_VALID_MS) {
+            console.log(`[autoSwitch][preheat] 已有预热账号: ${this._preheatedEmail}, 跳过`);
+            return;
+        }
+        this._preheating = true;
+        try {
+            // 找最佳候选（不需要比当前号好，只需要超过阈值）
+            const candidates = this._findAllCandidates(curEmail, s.threshold, s.scoreMode, 0);
+            if (candidates.length === 0) {
+                console.log('[autoSwitch][preheat] 无候选账号');
+                return;
+            }
+            const cand = candidates[0];
+            const candEntry = this._cache.get(cand.email);
+            const cacheFreshMs = s.refreshMin * 60000;
+            // 缓存足够新鲜则直接信任
+            if (candEntry && Date.now() - candEntry.ts < cacheFreshMs) {
+                this._preheatedEmail = cand.email;
+                this._preheatedAt = Date.now();
+                console.log(`[autoSwitch][preheat] ✓ 预热完成 (缓存新鲜): ${cand.email} score=${Math.round(cand.score)}%`);
+                return;
+            }
+            // 否则发 API 验证
+            console.log(`[autoSwitch][preheat] 验证候选: ${cand.email}...`);
+            await this.refreshSingle(cand.email, true);
+            const freshEntry = this._cache.get(cand.email);
+            if (!freshEntry?.snapshot) {
+                console.log(`[autoSwitch][preheat] 验证失败: ${cand.email} 无 snapshot`);
+                return;
+            }
+            const vd = clamp(freshEntry.snapshot.dailyRemainingPercent);
+            const vw = clamp(freshEntry.snapshot.weeklyRemainingPercent);
+            const vHasBalance = this._hasUsableBalance(freshEntry.snapshot);
+            const minQ = s.minQuota ?? 10;
+            if ((vd <= 1 || vw <= 1 || Math.min(vd, vw) <= minQ) && !vHasBalance) {
+                console.log(`[autoSwitch][preheat] 验证失败: ${cand.email} d=${Math.round(vd)}% w=${Math.round(vw)}% (耗尽)`);
+                return;
+            }
+            this._preheatedEmail = cand.email;
+            this._preheatedAt = Date.now();
+            console.log(`[autoSwitch][preheat] ✓ 预热完成 (API验证): ${cand.email} d=${Math.round(vd)}% w=${Math.round(vw)}%`);
+        }
+        catch (err) {
+            console.warn('[autoSwitch][preheat] error:', err);
+        }
+        finally {
+            this._preheating = false;
+        }
     }
     // ── 内部：自动切号 ──
     async _checkAndSwitch() {
@@ -482,11 +551,19 @@ class AutoSwitcher {
             const curScore = calcScore(dPct, wPct, s.scoreMode);
             const minPct = Math.min(dPct, wPct);
             const minQ = s.minQuota ?? 10;
+            // 余额号：有付费余额（≥阈值）时，配额耗尽仍视为可用
+            const hasOverageBalance = this._hasUsableBalance(snap);
             // 硬约束：若任一维度低于 minQuota，视为当前号不可用，强制触发切号
-            // 这避免了 scoreMode='daily' 时日限充足但周限耗尽却不切号的陷阱
-            const hardExhausted = minPct <= minQ;
+            // 但如果有付费余额，则不视为耗尽（继续用余额）
+            const hardExhausted = minPct <= minQ && !hasOverageBalance;
             if (!hardExhausted && curScore > s.threshold) {
                 // 当前号额度充足，无需切换
+                // 但如果接近阈值，后台预热候选
+                const preheatLine = s.threshold + (s.preheatMargin ?? DEFAULTS.preheatMargin);
+                if (curScore <= preheatLine && !this._preheating) {
+                    console.log(`[autoSwitch][preheat] 当前号接近阈值 (score=${Math.round(curScore)}, preheatLine=${preheatLine}), 触发预热`);
+                    this._triggerPreheat(curEmail, s).catch(() => { });
+                }
                 console.log(`[autoSwitch][trigger] 当前号额度充足，不切换: ${curEmail} curScore=${Math.round(curScore)} d=${Math.round(dPct)}% w=${Math.round(wPct)}% threshold=${s.threshold}`);
                 return;
             }
@@ -509,6 +586,9 @@ class AutoSwitcher {
             else {
                 reason = `周配额 ${Math.round(wPct)}%`;
             }
+            // hardExhausted 必然意味着无余额（有余额时不会进此分支），日志标注便于用户理解
+            if (hardExhausted)
+                reason += '（无余额）';
             // ── 惰性验证策略：按缓存分数排序候选，逐个验证后切号 ──
             // hardExhausted 时放宽阈值（当前号某个维度已耗尽，候选只需比 0 好即可）
             const findScore = hardExhausted ? 0 : curScore;
@@ -520,6 +600,21 @@ class AutoSwitcher {
                 this._onSwitchEvent?.(log, `${curEmail} ${reason} ${noHint}，无可用候选`, 'warn');
                 console.log(`[autoSwitch] ${curEmail} curScore=${Math.round(curScore)} d=${Math.round(dPct)} w=${Math.round(wPct)} no candidates`);
                 return;
+            }
+            // 优先使用预热账号（已提前验证，可零延迟切换）
+            if (this._preheatedEmail && Date.now() - this._preheatedAt < PREHEAT_VALID_MS) {
+                const pEntry = this._cache.get(this._preheatedEmail);
+                const pHasBalance = this._hasUsableBalance(pEntry?.snapshot);
+                if (pEntry?.snapshot) {
+                    const pd = clamp(pEntry.snapshot.dailyRemainingPercent);
+                    const pw = clamp(pEntry.snapshot.weeklyRemainingPercent);
+                    const pScore = calcScore(pd, pw, s.scoreMode);
+                    if ((pScore > findScore || pHasBalance) && (pd > 1 && pw > 1 || pHasBalance)) {
+                        console.log(`[autoSwitch][preheat] ★ 使用预热账号: ${this._preheatedEmail} score=${Math.round(pScore)}%`);
+                        candidates.unshift({ email: this._preheatedEmail, score: pScore, hasBalance: pHasBalance });
+                    }
+                }
+                this._preheatedEmail = null;
             }
             // 逐个验证：缓存新鲜的直接信任，过期的发 1 次 API 验证
             const cacheFreshMs = s.refreshMin * 60000;
@@ -544,8 +639,10 @@ class AutoSwitcher {
                 }
                 const vd = clamp(freshEntry.snapshot.dailyRemainingPercent);
                 const vw = clamp(freshEntry.snapshot.weeklyRemainingPercent);
-                if (vd <= 1 || vw <= 1 || Math.min(vd, vw) <= minQ) {
-                    console.log(`[autoSwitch][verify] #${i + 1} ${cand.email} 验证失败: d=${Math.round(vd)}% w=${Math.round(vw)}% (耗尽)`);
+                const vHasBalance = this._hasUsableBalance(freshEntry.snapshot);
+                // 有余额（≥阈值）的号即使配额低也视为可用
+                if ((vd <= 1 || vw <= 1 || Math.min(vd, vw) <= minQ) && !vHasBalance) {
+                    console.log(`[autoSwitch][verify] #${i + 1} ${cand.email} 验证失败: d=${Math.round(vd)}% w=${Math.round(vw)}% (耗尽且无余额)`);
                     continue;
                 }
                 const vScore = calcScore(vd, vw, s.scoreMode);
@@ -586,6 +683,8 @@ class AutoSwitcher {
                 this._lastSwitchedAt = Date.now();
                 (0, healthCheckPanel_1.clearHealthResult)(verified.email);
                 this._tracker.recordDiagnostic({ ts: Date.now(), email: verified.email, source: 'health', level: 'ok', reason: '自动切号成功，测活已清除' });
+                // 切号后静默重置机器码（减少风控关联）
+                (0, healthCheckPanel_1.silentResetMachineId)().catch(() => { });
                 console.log(`[autoSwitch][trigger] ✓ 切号成功: ${curEmail} → ${verified.email}, cooldown=${s.cooldownSec}s`);
                 // 记录切号统计
                 this._tracker.recordSwitch(verified.email);
@@ -641,6 +740,13 @@ class AutoSwitcher {
             const curEmail = this._ctx.globalState.get('lastEmail');
             if (!curEmail)
                 return null;
+            // ── 余额保护：当前号有付费余额时不切号 ──
+            const curEntry = this._cache.get(curEmail);
+            if (this._hasUsableBalance(curEntry?.snapshot)) {
+                const balance = curEntry?.snapshot?.overageBalanceMicros || 0;
+                console.log(`[autoSwitch][trigger] forceSwitch: 当前号 ${curEmail} 有付费余额 $${(balance / 1000000).toFixed(2)}，跳过切号`);
+                return { email: '__balance_skip__' };
+            }
             // ── 第 1 步：纯缓存挑号（0ms）──
             // 信号触发说明当前号 UI 已报错，不需要再 API 验证
             let cand = this._findBest(curEmail, 0, s.scoreMode);
@@ -670,6 +776,8 @@ class AutoSwitcher {
                 return null;
             (0, healthCheckPanel_1.clearHealthResult)(cand.email);
             this._tracker.recordDiagnostic({ ts: Date.now(), email: cand.email, source: 'health', level: 'ok', reason: '强制切号成功，测活已清除' });
+            // 切号后静默重置机器码（减少风控关联）
+            (0, healthCheckPanel_1.silentResetMachineId)().catch(() => { });
             // 更新状态
             this._cooldownUntil = Date.now() + s.cooldownSec * 1000;
             this._lastSwitchedFrom = curEmail;
@@ -761,21 +869,25 @@ class AutoSwitcher {
             }
             const dPct = clamp(entry.snapshot.dailyRemainingPercent);
             const wPct = clamp(entry.snapshot.weeklyRemainingPercent);
+            const candHasBalance = this._hasUsableBalance(entry.snapshot);
             // 硬约束 1：任一维度 ≤1% 视为耗尽，绝对不选（不受 minQ 配置影响）
             // 典型场景：周 0% 日 100% 的账号实际不可用
-            if (dPct <= 1 || wPct <= 1) {
+            // 但有付费余额（≥阈值）的号即使配额耗尽也视为可用
+            if ((dPct <= 1 || wPct <= 1) && !candHasBalance) {
                 rejectedDueToMinQ++;
                 continue;
             }
             // 硬约束 2：两个维度取 min，低于 minQ 配置值也不选
+            // 但有付费余额的号例外
             const minViable = Math.min(dPct, wPct);
-            if (minViable <= minQ) {
+            if (minViable <= minQ && !candHasBalance) {
                 rejectedDueToMinQ++;
                 continue;
             }
             const score = calcScore(dPct, wPct, mode);
-            if (score > effectiveThreshold)
-                candidates.push({ email, score });
+            // 有余额的号即使 score 低于阈值也纳入候选（配额耗尽但余额可用）
+            if (score > effectiveThreshold || candHasBalance)
+                candidates.push({ email, score, hasBalance: candHasBalance });
             else
                 rejectedDueToThreshold++;
         }
@@ -783,23 +895,29 @@ class AutoSwitcher {
             console.log(`[autoSwitch] findAllCandidates: 0 candidates (checked ${this._cache.size}, rejected free=${rejectedDueToFree} minQ=${rejectedDueToMinQ} threshold=${rejectedDueToThreshold} locked=${rejectedDueToLock}, effectiveThreshold=${effectiveThreshold})`);
             return [];
         }
+        // 余额号始终下沉到最后：用户付费后通常期望“先用完免费配额，再消耗付费余额”
+        const freeQuotaCands = candidates.filter(c => !c.hasBalance);
+        const balanceCands = candidates.filter(c => c.hasBalance);
         // 按策略排序
         if (strategy === 'lowestNonZero') {
-            // 分两组：已用号（score ≤ prefUsed）和满额号（score > prefUsed）
-            const used = candidates.filter(c => c.score <= prefUsed);
-            const fresh = candidates.filter(c => c.score > prefUsed);
-            // 优先选已用号中额度最低的（消耗完再换新号），然后是满额号
+            // 分两组：已用号（score ≤ prefUsed）和满额号（score > prefUsed）—— 仅在非余额号内部分组
+            const used = freeQuotaCands.filter(c => c.score <= prefUsed);
+            const fresh = freeQuotaCands.filter(c => c.score > prefUsed);
+            // 优先选已用号中额度最低的（消耗完再换新号），然后是满额号，最后才是余额号
             used.sort((a, b) => a.score - b.score);
             fresh.sort((a, b) => a.score - b.score);
-            const result = [...used, ...fresh];
-            console.log(`[autoSwitch] findAllCandidates: strategy=lowestNonZero, ${result.length} candidates, top3: ${result.slice(0, 3).map(c => `${c.email.substring(0, 15)}..=${Math.round(c.score)}%`).join(', ')}`);
+            balanceCands.sort((a, b) => a.score - b.score);
+            const result = [...used, ...fresh, ...balanceCands];
+            console.log(`[autoSwitch] findAllCandidates: strategy=lowestNonZero, ${result.length} candidates (free=${freeQuotaCands.length} balance=${balanceCands.length}), top3: ${result.slice(0, 3).map(c => `${c.email.substring(0, 15)}..=${Math.round(c.score)}%${c.hasBalance ? '💰' : ''}`).join(', ')}`);
             return result;
         }
         else {
-            // highestFirst：选额度最高的
-            candidates.sort((a, b) => b.score - a.score);
-            console.log(`[autoSwitch] findAllCandidates: strategy=highestFirst, ${candidates.length} candidates, top3: ${candidates.slice(0, 3).map(c => `${c.email.substring(0, 15)}..=${Math.round(c.score)}%`).join(', ')}`);
-            return candidates;
+            // highestFirst：选额度最高的；余额号始终垫底
+            freeQuotaCands.sort((a, b) => b.score - a.score);
+            balanceCands.sort((a, b) => b.score - a.score);
+            const result = [...freeQuotaCands, ...balanceCands];
+            console.log(`[autoSwitch] findAllCandidates: strategy=highestFirst, ${result.length} candidates (free=${freeQuotaCands.length} balance=${balanceCands.length}), top3: ${result.slice(0, 3).map(c => `${c.email.substring(0, 15)}..=${Math.round(c.score)}%${c.hasBalance ? '💰' : ''}`).join(', ')}`);
+            return result;
         }
     }
     /**
